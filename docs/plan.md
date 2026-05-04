@@ -402,10 +402,9 @@ Each phase ends with something deployed and shareable.
 
 - Public GH repo (`shillscore`), MIT license. ✓
 - Folders: `apps/api/`, `apps/web/`, `packages/shared/`, `infra/`, `scripts/`, `docs/`. ✓
-- ADR 0001 (monorepo layout). ✓
 - README, plan, data-model docs in `docs/`. ✓
 
-Pending sync of v3 plan + price-model update into the repo.
+Decisions log in §0 above is the canonical record. ADRs are added going forward when a material new decision is made with the user — not written retroactively to justify the current state.
 
 ### Phase 1 — single-user MVP, no UI (weekend 1)
 
