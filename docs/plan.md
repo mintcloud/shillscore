@@ -1,8 +1,8 @@
-# Twitter Alpha Lab — Build Plan (v3, canonical)
+# shillscore — Build Plan (v3, canonical)
 
 A public, open-source dashboard that turns crypto-Twitter into a backtested feed. Connect Twitter → parse token mentions across followed accounts → snapshot price at mention time → rank accounts by signal quality. Network effect: once an account is parsed for one user, every later user only triggers a *diff* fetch.
 
-This document is canonical. It supersedes `twitter-alpha-lab-plan-v2.md` (`20260504-172438-c8be0f`) by folding in the granularity/window decision (`20260504-173204-f6215c`) and the fidelity/bias decision (`20260504-174328-d731fb`). The brief Vercel/Supabase detour and the pivot-analysis doc are not part of the canonical record — stack stayed Hetzner + FastAPI + Postgres + Redis + arq + Next.js throughout.
+This document is canonical. It supersedes the prior v1 and v2 planning drafts by folding in the granularity/window decision (`20260504-173204-f6215c`) and the fidelity/bias decision (`20260504-174328-d731fb`). The brief Vercel/Supabase detour and the pivot-analysis doc are not part of the canonical record — stack stayed Hetzner + FastAPI + Postgres + Redis + arq + Next.js throughout.
 
 ---
 
@@ -38,7 +38,7 @@ Still open (defaults noted):
 | Question | Default if not answered |
 |---|---|
 | Twitter API tier | Basic ($200/mo) from day 1 |
-| Repo name | `twitter-alpha-lab` (current GH: `shillscore`) |
+| Repo name | `shillscore` |
 | Domain | Subdomain of `theogonella.com` |
 
 ---
@@ -415,7 +415,7 @@ Pending sync of v3 plan + price-model update into the repo.
 - Worker: `extend_token_prices_daily`, `refresh_benchmark_prices`.
 - Daily cron: `REFRESH MATERIALIZED VIEW mention_returns`, `account_leaderboard`.
 - Nightly: `bootstrap_account_ci`.
-- CLI: `python -m alphalab seed --user theogonella` runs end-to-end on your follows.
+- CLI: `python -m shillscore seed --user theogonella` runs end-to-end on your follows.
 - Acceptance: SQL query against `account_leaderboard` returns sorted accounts with CIs.
 
 ### Phase 2 — public leaderboard UI (weekend 2)
@@ -492,7 +492,7 @@ If user count grows past ~50 connected users (several thousand accounts under sy
 ## 10. Open decisions for you
 
 1. Twitter API tier — Basic ($200/mo) day 1? *Default: yes.*
-2. Repo name — keep `shillscore`, or rename to `twitter-alpha-lab`? *Default: keep `shillscore`.*
+2. Repo name — keep `shillscore`. *Settled.*
 3. Domain — subdomain of `theogonella.com`? *Default: yes.*
 
 Silence = defaults.
@@ -503,6 +503,6 @@ Silence = defaults.
 
 - Sync v3 plan + new price-model doc into `~/projects/shillscore/docs/` and push to GH.
 - Scaffold phases 0 + 1 (FastAPI app, arq workers, Postgres + Redis in compose).
-- Working `python -m alphalab seed` runs end-to-end against your Twitter follows on the VPS.
+- Working `python -m shillscore seed` runs end-to-end against your Twitter follows on the VPS.
 - README with the architecture diagram and the "why I built this" paragraph.
 - Telegram message back with the leaderboard SQL output as a screenshot.
