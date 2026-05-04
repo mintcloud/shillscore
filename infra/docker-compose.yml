@@ -1,0 +1,89 @@
+name: shillscore
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: shillscore-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-shillscore}
+      POSTGRES_USER: ${POSTGRES_USER:-shillscore}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    volumes:
+      - shillscore_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-shillscore}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [shillscore]
+
+  redis:
+    image: redis:7-alpine
+    container_name: shillscore-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - shillscore_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [shillscore]
+
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+    container_name: shillscore-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shillscore}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-shillscore}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    networks: [shillscore]
+    # internal-only; Next.js reaches it via the docker network as http://api:8000
+
+  worker:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+    container_name: shillscore-worker
+    restart: unless-stopped
+    command: ["python", "-m", "arq", "app.worker.main.WorkerSettings"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shillscore}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-shillscore}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    networks: [shillscore]
+
+  web:
+    build:
+      context: ../apps/web
+      dockerfile: Dockerfile
+    container_name: shillscore-web
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      INTERNAL_API_URL: http://api:8000
+      NEXT_PUBLIC_SITE_URL: https://${PUBLIC_HOSTNAME:-shillscore.tg-itsavibe.com}
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:3006:3000"   # Cloudflare tunnel routes shillscore.tg-itsavibe.com -> :3006
+    networks: [shillscore]
+
+volumes:
+  shillscore_pgdata:
+  shillscore_redisdata:
+
+networks:
+  shillscore:
+    driver: bridge
