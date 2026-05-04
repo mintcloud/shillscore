@@ -20,7 +20,7 @@ Resolved in conversation:
   - **Aged** (`> 23h`): ±24h at **hourly** resolution (~25 points).
   - These rows live in `token_prices` with a `granularity` column; we do not back-fill 5-min for stale mentions (the data isn't there).
 - **PnL window: 90d → 365d.** Storage is ~30 MB; CoinGecko free tier handles it. `is_closed` flips at 365d. Add `r_180d` and `r_365d` to the materialized view.
-- **Tweet lookback: adaptive deepening, not flat 365d.** Twitter API is the wall (5K accts × 365d × 3 tw/d ≈ 110× over Basic's 50K/mo). Ship 90d initial; deepen to 180d / 270d / 365d only for accounts that hit ≥5 resolved mentions. The boring ~80% stop at 90d.
+- **Tweet lookback: adaptive deepening, not flat 365d.** X API credits are the wall — every redundant fetch is real money. Ship 90d initial; deepen to 180d / 270d / 365d only for accounts that hit ≥5 resolved mentions. The boring ~80% stop at 90d. (For reference: 5K accts × 365d × 3 tw/d ≈ 5.5M tweet pulls if you went flat — adaptive cuts that by an order of magnitude.)
 - **Macro/regime bias: excess return is primary, raw is secondary.** New `benchmark_prices` table (BTC, ETH daily). `r_365d_excess = r_365d_token − r_365d_BTC`. Leaderboard sorts on excess by default; raw is a toggle.
 - **Sample-size asymmetry: fixed shared lookback for ranking.** Adaptive deepening enriches the account detail page but *the leaderboard score uses a fixed 365d window*. Decouples "how much we know" from "what we rank on."
 - **Survivorship within the deepened set: leave it.** Self-correcting — extending lookback usually surfaces worse pre-period and *lowers* the score.
@@ -32,12 +32,12 @@ Resolved in conversation:
 - **Open source from day 1.** Public GH repo, MIT license. GitHub login as secondary auth + profile flair.
 - **You seed it.** User #1, you eat the cold-start cost.
 - **Privacy stance.** No "user X follows account Y" ever shown publicly. Per-user follow lists are local plumbing, deleted on disconnect.
+- **X API access: pay-per-use credits, not a flat-fee tier.** Reuse Theo's existing pay-per-use credit account; mint a fresh OAuth 2.0 app for shillscore (own `client_id` + `client_secret`, tokens stored separately from twitter-digest). Architecture must minimise call volume: batch user/tweet lookups (up to 100 ids/call), persistent cache so we never re-fetch the same tweet, cron cadence tuned to credit budget — not freshness. Failure mode is "spent real money," not "rate-limited."
 
 Still open (defaults noted):
 
 | Question | Default if not answered |
 |---|---|
-| Twitter API tier | Basic ($200/mo) from day 1 |
 | Repo name | `shillscore` |
 | Domain | Subdomain of `theogonella.com` |
 
@@ -476,21 +476,21 @@ Decisions log in §0 above is the canonical record. ADRs are added going forward
 
 ## 9. Cost & rate-limit budget
 
-| Resource | Free | Paid v1 | Notes |
+| Resource | Cost model | v1 estimate | Notes |
 |---|---|---|---|
-| Twitter API | 1,500 reads/mo | $200/mo Basic = 50k reads | Need Basic for real use; adaptive deepening keeps us under cap |
-| CoinGecko | 30 calls/min | $129/mo Demo | Free is fine for v1 with caching; daily series + per-mention windows is bounded |
+| X API | Pay-per-use credits (Theo's existing account) | ~$20–60/mo at v1 cadence | Variable, scales with call volume. Batch lookups (up to 100 ids/call), aggressive cache, no polling. Adaptive deepening keeps tweet pulls bounded. |
+| CoinGecko | Free 30 calls/min, optional $129/mo Demo | $0 | Free is fine for v1 with caching; daily series + per-mention windows is bounded |
 | Hetzner | already paying | already paying | shared with other services |
 | Cloudflare | $0 | $0 | tunnel + DNS |
-| **Total v1** | | **~$200/mo** | mostly Twitter |
+| **Total v1** | | **~$20–60/mo** | all variable, dominated by X credits |
 
-If user count grows past ~50 connected users (several thousand accounts under sync), bump to Twitter Pro ($5k/mo) and decide on monetization at that point.
+Credits change the failure mode: you don't get rate-limited, you spend real money. Every new ingest path goes through a credit-cost sanity check before merging. If user count grows past ~50 connected users (several thousand accounts under sync), revisit the cost model at that point — credits may stay cheaper than Pro depending on cadence.
 
 ---
 
 ## 10. Open decisions for you
 
-1. Twitter API tier — Basic ($200/mo) day 1? *Default: yes.*
+1. X API access — pay-per-use credits via existing account, fresh OAuth 2.0 app for shillscore. *Settled.*
 2. Repo name — keep `shillscore`. *Settled.*
 3. Domain — subdomain of `theogonella.com`? *Default: yes.*
 
