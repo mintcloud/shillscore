@@ -1,168 +1,129 @@
-# Price model — redesign
+# Price model — canonical
 
-You're right. My original `price_snapshots(token_id, ts)` with four anchor points (t0, +1d, +7d, +30d) gives me enough for a leaderboard number but kills the chart UX. If we want to plot price action from tweet → now, we need a continuous series.
+Two stores, separated cleanly. The anchor is denormalized onto every mention; the rest of the price history lives in a mixed-granularity time-series table.
 
-Here's the corrected model.
+This doc is the canonical version, superseding the earlier hourly-only design. See `plan.md` §3 for the full context.
 
 ---
 
 ## What we store
 
-Two things, separated cleanly:
-
-### 1. The anchor price, denormalized onto each mention
+### 1. Anchor price, denormalized onto each mention
 
 ```sql
 ALTER TABLE mentions
   ADD COLUMN price_at_mention      NUMERIC(30,10),
-  ADD COLUMN price_at_mention_ts   TIMESTAMPTZ,         -- the exact bucket we used
-  ADD COLUMN price_source          TEXT;                -- 'coingecko'|'defillama'
+  ADD COLUMN price_at_mention_ts   TIMESTAMPTZ,         -- exact bucket we used
+  ADD COLUMN price_anchor_kind     TEXT,                -- '5min' | 'hourly' | 'daily-fallback'
+  ADD COLUMN price_source          TEXT;                -- 'coingecko' | 'defillama'
 ```
 
-Why denormalize: this number is *the* anchor of the mention's PnL forever. It never changes. Storing it on the row makes every downstream query a single read. We snap it to the nearest hourly bucket (within ±30 min of `tweet_ts`) and remember which bucket we used.
+Why denormalize: this is *the* anchor of the mention's PnL forever. It never changes. Every downstream query reads it once.
 
-### 2. A continuous price series per token
+The bucket we snap to depends on how fresh the mention is when we first see it (see priority queue below).
+
+### 2. Mixed-granularity price series per token
 
 ```sql
 CREATE TABLE token_prices (
-  token_id  BIGINT REFERENCES tokens(id),
-  ts        TIMESTAMPTZ NOT NULL,        -- hourly bucket (UTC, minute=0)
-  close_usd NUMERIC(30,10) NOT NULL,
-  source    TEXT,
-  PRIMARY KEY (token_id, ts)
+  token_id    BIGINT REFERENCES tokens(id),
+  ts          TIMESTAMPTZ NOT NULL,
+  close_usd   NUMERIC(30,10) NOT NULL,
+  granularity TEXT NOT NULL,            -- '5min' | 'hourly' | 'daily'
+  source      TEXT,
+  PRIMARY KEY (token_id, ts, granularity)
 );
 CREATE INDEX ON token_prices (token_id, ts DESC);
+CREATE INDEX ON token_prices (token_id, granularity, ts);
 ```
 
-One row per token per hour. Coverage: `[earliest_mention_ts - 1h, now()]` for every token that has at least one mention. We extend forward continuously as time passes; we never expire old rows (storage is a non-issue: ~2M rows for 1000 tokens × 3 months).
+Three populations of rows live here:
 
-This replaces the old `price_snapshots` table entirely.
+- **5-min slabs** around fresh mentions (±2h, written when the mention is first seen and `tweet_ts` is < 23h old — CoinGecko only exposes 5-min data within the last 24h).
+- **Hourly slabs** around aged mentions (±24h, written when the priority queue picks them up).
+- **Daily continuous series** for every active token, topped up by a daily cron. This is what powers the chart and the PnL math in `mention_returns`.
+
+Storage budget at v1 scale (1k tokens, 1 year, ~30k mentions): ~2M rows total. Trivial.
+
+### 3. Benchmarks (for excess return)
+
+```sql
+CREATE TABLE benchmark_prices (
+  symbol      TEXT NOT NULL,            -- 'BTC' | 'ETH'
+  ts          TIMESTAMPTZ NOT NULL,     -- daily, UTC midnight
+  close_usd   NUMERIC(30,10) NOT NULL,
+  PRIMARY KEY (symbol, ts)
+);
+```
+
+We score on `r_365d_excess = r_365d_token − r_365d_BTC` to strip out market regime. Raw return is kept as a UI toggle.
 
 ---
 
 ## How prices get populated
 
-Three jobs, all in the worker pool.
+Four jobs, all in the worker pool.
 
 ```
-on_new_mention(mention_id):
-    bucket = round_to_hour(mention.tweet_ts)
-    if (token_id, bucket) not in token_prices:
-        fetch CoinGecko market_chart_range(token, bucket-1h, bucket+1h)
-        upsert token_prices
-    mention.price_at_mention      = token_prices[bucket].close_usd
-    mention.price_at_mention_ts   = bucket
-```
+on_new_mention(mention_id):                              # priority-queued
+    age = now() - mention.tweet_ts
+    if age < 23h:
+        window = (tweet_ts - 2h, tweet_ts + 2h)
+        gran   = '5min'
+    else:
+        window = (tweet_ts - 24h, tweet_ts + 24h)
+        gran   = 'hourly'
+    fetch CoinGecko market_chart_range(token, *window)
+    upsert token_prices(... granularity=gran)
+    pick the bucket nearest tweet_ts → write back to mention as anchor
 
-```
-backfill_token_history(token_id):
-    # First time we see this token
-    earliest = (SELECT MIN(tweet_ts) FROM mentions WHERE token_id = $t)
+extend_token_prices_daily(token_id):                     # daily cron
+    last = SELECT MAX(ts) FROM token_prices
+           WHERE token_id=$t AND granularity='daily'
+    fetch CoinGecko market_chart_range(token, last, now)  # daily resolution
+    upsert token_prices(... granularity='daily')
+
+refresh_benchmark_prices():                              # daily cron
+    fetch BTC and ETH daily closes since last
+    upsert benchmark_prices
+
+backfill_token_history(token_id):                        # one-shot, on first sight
+    earliest = SELECT MIN(tweet_ts) FROM mentions WHERE token_id = $t
     fetch CoinGecko market_chart_range(token, earliest, now)
-    upsert token_prices  (resampled to hourly)
+    upsert token_prices(... granularity='daily', source='coingecko')
 ```
 
-```
-extend_token_prices(token_id):
-    # Keep every token current, runs hourly via cron
-    last = (SELECT MAX(ts) FROM token_prices WHERE token_id = $t)
-    fetch CoinGecko market_chart_range(token, last, now)
-    upsert token_prices
-```
+**Priority queue.** `on_new_mention` jobs are queued with `priority = age(tweet_ts)`. The 24h CoinGecko 5-min window is a hard ceiling — we must process fresh mentions before they age out. arq's job priorities (or a separate "fresh" queue) handle this; the worker drains fresh first, then catches up on aged.
 
-CoinGecko's `/coins/{id}/market_chart/range` already returns hourly granularity for ranges within 90 days, daily beyond. We resample to hourly buckets (forward-fill if a gap, label `source='coingecko-ff'` so we know).
+**No 5-min back-fill for stale mentions.** The data isn't there. A mention first ingested >24h after its tweet gets the hourly window and a `price_anchor_kind='hourly'` flag. If somehow even the hourly window is unavailable, fall back to the closest daily close and flag `'daily-fallback'`.
 
 ---
 
-## How the chart works
+## How charts read it
 
-Per-mention chart is a single query:
+A per-mention chart blends granularities:
 
 ```sql
-SELECT ts, close_usd
+SELECT ts, close_usd, granularity
 FROM token_prices
 WHERE token_id = $token
-  AND ts BETWEEN $tweet_ts AND $tweet_ts + INTERVAL '90 days'
+  AND ts BETWEEN $tweet_ts - INTERVAL '2 hours'
+              AND $tweet_ts + INTERVAL '365 days'
 ORDER BY ts;
 ```
 
-Plot it. Mark the anchor point at `(tweet_ts, price_at_mention)` with a vertical line. End of the chart is either +90d or `now()`, whichever comes first — that's your "open window."
-
-For "from the tweet till now" without the 90-day cap, drop the upper bound:
-
-```sql
-WHERE token_id = $token AND ts >= $tweet_ts
-```
-
-Which view to show is a UI toggle — I'd default to "min(now, +90d)" so the leaderboard math and the chart agree.
+Render the high-res slab tightly around `(tweet_ts, price_at_mention)` (vertical anchor marker), daily series afterward. UI default x-axis ends at `min(now(), tweet_ts + 365d)`.
 
 ---
 
-## How PnL / signal scoring works now
+## How scoring reads it
 
-Computed on the fly from the series, no pre-canned snapshot columns:
+PnL math in `mention_returns` (materialized view, refreshed daily) uses **only the daily granularity** for `r_1d` / `r_7d` / `r_30d` / `r_90d` / `r_180d` / `r_365d`. The 5-min/hourly slabs feed a separate small view that produces `r_5min` / `r_15min` / `r_1h` for the freshness-window mentions only — these are surfaced on the account detail page (and feed the "moves price" badge for >100k-follower accounts) but don't enter the leaderboard score.
 
-```sql
--- For one mention
-WITH anchor AS (
-  SELECT price_at_mention AS p0, tweet_ts FROM mentions WHERE id = $m
-),
-horizons AS (
-  SELECT
-    (SELECT close_usd FROM token_prices
-     WHERE token_id = $t AND ts <= a.tweet_ts + INTERVAL '1 day'
-     ORDER BY ts DESC LIMIT 1) AS p_1d,
-    (SELECT close_usd FROM token_prices
-     WHERE token_id = $t AND ts <= a.tweet_ts + INTERVAL '7 days'
-     ORDER BY ts DESC LIMIT 1) AS p_7d,
-    (SELECT close_usd FROM token_prices
-     WHERE token_id = $t AND ts <= a.tweet_ts + INTERVAL '30 days'
-     ORDER BY ts DESC LIMIT 1) AS p_30d,
-    (SELECT close_usd FROM token_prices
-     WHERE token_id = $t AND ts <= a.tweet_ts + INTERVAL '90 days'
-     ORDER BY ts DESC LIMIT 1) AS p_90d,
-    (SELECT close_usd FROM token_prices
-     WHERE token_id = $t ORDER BY ts DESC LIMIT 1)            AS p_now
-  FROM anchor a
-)
-SELECT (p_1d - p0)/p0 r_1d, (p_7d - p0)/p0 r_7d,
-       (p_30d - p0)/p0 r_30d, (p_90d - p0)/p0 r_90d,
-       (p_now - p0)/p0 r_open
-FROM anchor, horizons;
-```
-
-For the leaderboard we materialize this into a view that refreshes hourly:
-
-```sql
-CREATE MATERIALIZED VIEW mention_returns AS
-SELECT m.id, m.account_id, m.token_id, m.tweet_ts, m.price_at_mention,
-       <the horizon math above>,
-       (m.tweet_ts + INTERVAL '90 days' < now()) AS is_closed
-FROM mentions m;
-```
-
-A mention is **closed** when 90 days have passed since `tweet_ts`. The leaderboard ranks on `r_90d` over closed mentions only — that's the only honest "did this account pick winners?" number. We separately show `r_open` for mentions still inside their window, labelled "still open" in the UI so people don't conflate them.
+Leaderboard sorts on `r_365d_excess` by default, with a "raw return" toggle.
 
 ---
 
-## What changes vs the original plan
+## Migration notes
 
-| Thing | Before | After |
-|---|---|---|
-| Table for prices | `price_snapshots(token_id, ts)`, 4 rows per mention | `token_prices(token_id, ts)`, hourly continuous |
-| Anchor price | One row in `price_snapshots` with `ts == tweet_ts` | Denormalized onto `mentions.price_at_mention` |
-| Chart support | Not really — only 4 dots | Native — query the series |
-| PnL columns | Pre-stored on snapshots | Computed in materialized view from series |
-| 90-day window | Implicit | Explicit `is_closed` flag, drives leaderboard |
-| Storage | Tiny | ~2M rows per 1000 tokens — still tiny |
-
-Section 3 (data model) and section 6 (signal scoring) of the original plan are superseded by this doc. Everything else stands.
-
----
-
-## Two small calls baked in (overridable)
-
-1. **Hourly granularity, not 5-min.** CoinGecko gives 5-min data only within the last day. Backfilling old mentions caps you at hourly anyway, so consistency wins. 5-min wouldn't change leaderboard scoring meaningfully.
-2. **No "high/low" bands stored.** Just close. If you want "max drawdown during the window" later, we can add `high`/`low` to `token_prices` — non-breaking change.
-
-If you want either flipped, say so before I scaffold.
+Originally proposed: hourly continuous series everywhere. Switched to daily continuous + per-mention slabs because at ≤10 users daily resolution is sufficient for every horizon we score on, and CoinGecko's free tier handles daily comfortably. The schema is timestamp-keyed and granularity-agnostic — bumping daily to hourly later is a non-breaking config change.
