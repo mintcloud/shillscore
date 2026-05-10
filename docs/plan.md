@@ -376,6 +376,19 @@ Caps and guardrails:
 - **Cursor drift safety:** if `last_synced_at` > 7 days ago, treat as cold even if `last_tweet_id` exists (Twitter `since_id` doesn't reliably work past ~7 days).
 - **Adaptive deepening fires per account, not per user.** First user to surface an account pays the 90-day cost; deepening to 180/270/365 is amortized across all users who follow it.
 
+> **⚠️ Phase 1 implementation deviates from this design — must be fixed before Phase 3.**
+>
+> `sync_batch` in `apps/api/app/worker/jobs.py` resolves `since_id` at the **batch level**, not per account:
+>
+> ```python
+> last_ids = [a.last_tweet_id for a in accts if a.last_tweet_id]
+> since_id = min(last_ids, key=int) if len(last_ids) == len(accts) else None
+> ```
+>
+> If even one account in a batch of 25 lacks a `last_tweet_id` (i.e. is "cold"), the whole batch falls through to `start_time = now - 90d` and re-pays for 90 days for all 25 accounts. With the enqueue loop using no `ORDER BY`, a typical 90% overlap / 10% new mix puts ≥1 cold account in ~93% of batches → ~93% of batches refetch 90 days for everything. Cost variance for a 1800-overlap + 200-new sync: $6 (lucky row order) to $66 (unlucky). The `counts/all` preflight only short-circuits batches where every handle was silent in the window, so it doesn't save mixed batches that contain active KOLs.
+>
+> **Required fix before Phase 3:** partition each batch into `with_since` and `without_since` lists at the top of `sync_batch` (or pre-partition at enqueue time in `sync_user_following`), then fire two separate scoped X calls per batch. Preserves the 25-handle batching efficiency. ~10–30 LOC.
+
 ---
 
 ## 6. Token mention parsing
@@ -428,6 +441,8 @@ Decisions log in §0 above is the canonical record. ADRs are added going forward
 
 ### Phase 3 — second user + network-effect plumbing (weekend 3)
 
+- **PREREQ — fix `sync_batch` per-account cursor logic.** See callout in §5. Without this, every Phase 3 sync with mixed cold+hot accounts re-pays 90 days for the hot ones. Blocking.
+- **PREREQ — make `sync_user_following` user-scoped.** Currently hard-codes `User.id.asc().limit(1)` (`apps/api/app/worker/jobs.py:43-44`); must accept a `user_id` param so per-user diffs work.
 - "Connect Twitter" button live.
 - Diff logic from §5. 200/day back-fill cap.
 - `consider_deepening` runs after each sync.
