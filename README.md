@@ -2,7 +2,7 @@
 
 Accuracy tracker for crypto Twitter calls. Watch the people you follow, see how their picks actually played out, follow the ones with real edge.
 
-> **Status: Phase 0 scaffold.** Compose stack + FastAPI/arq/Next.js skeletons + initial migration are in. No business logic yet — Phase 1 brings the worker pipeline. See [`docs/plan.md`](docs/plan.md) for the canonical build plan.
+> **Status: Phase 1 — single-user MVP backend.** OAuth 2.0 PKCE, Twitter sync, mention parsing, CoinGecko price anchors, daily series + benchmark cron, materialized views for `mention_returns` and `account_leaderboard`, bootstrap CI nightly. UI is still Phase 0; leaderboard SQL is the acceptance surface. See [`docs/plan.md`](docs/plan.md).
 
 ## What it does
 
@@ -38,20 +38,44 @@ scripts/                   Operational scripts
 docs/                      Plan + data-model docs
 ```
 
-## Running locally
+## Running
 
 ```bash
-cp infra/.env.example infra/.env
-# fill in POSTGRES_PASSWORD, SESSION_SECRET, TWITTER_*, GITHUB_* (Phase 1+)
-
+cp infra/.env.example infra/.env   # fill in TWITTER_*, generate POSTGRES_PASSWORD + SESSION_SECRET
 make build
 make up
-make migrate          # apply initial schema
-curl http://localhost:3006/   # web
-docker compose -f infra/docker-compose.yml exec api curl -s http://localhost:8000/health
+make migrate          # 0001 schema + 0002 views + user oauth columns
+curl http://localhost:3006/                                    # web
+docker compose -f infra/docker-compose.yml exec api \
+  curl -s http://localhost:8000/health
 ```
 
-The web container binds to `127.0.0.1:3006` so the Cloudflare tunnel can route `shillscore.tg-itsavibe.com` to it. See [`infra/cloudflare-tunnel.md`](infra/cloudflare-tunnel.md) for the tunnel ingress entry.
+The web container binds to `127.0.0.1:3006` so the Cloudflare tunnel can route `shillscore.tg-itsavibe.com` to it. See [`infra/cloudflare-tunnel.md`](infra/cloudflare-tunnel.md) for the tunnel ingress entry. Both `/api/*` and `/auth/*` are proxied from web → api over the internal docker network.
+
+## Phase 1: end-to-end seed run
+
+```bash
+# 1. Auth via browser (creates a `users` row + stores OAuth tokens)
+open https://shillscore.tg-itsavibe.com/auth/twitter
+
+# 2. Trigger the seed: pulls follow list, syncs each account, parses mentions,
+#    fetches per-mention price anchors, writes them back.
+make shell-api
+python -m shillscore seed --user theogonella
+
+# 3. Wait for the queue to drain (watch worker logs)
+make logs
+
+# 4. Inspect the leaderboard
+make psql
+shillscore=> REFRESH MATERIALIZED VIEW mention_returns;
+shillscore=> REFRESH MATERIALIZED VIEW account_leaderboard;
+shillscore=> SELECT handle, n_closed, median_excess
+             FROM account_leaderboard
+             ORDER BY median_excess DESC NULLS LAST LIMIT 25;
+```
+
+A daily cron (`06:00–06:30 UTC`) keeps benchmarks, daily price series, and both materialized views fresh, plus runs the bootstrap-CI pass.
 
 ## License
 

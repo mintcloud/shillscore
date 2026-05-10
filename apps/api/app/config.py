@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     twitter_client_id: str = Field("", alias="TWITTER_CLIENT_ID")
     twitter_client_secret: str = Field("", alias="TWITTER_CLIENT_SECRET")
     twitter_redirect_uri: str = Field("", alias="TWITTER_REDIRECT_URI")
+    # App-only OAuth 2.0 Bearer (client_credentials grant). Required for
+    # /tweets/search/all and /tweets/counts/all — those endpoints reject
+    # user-context tokens.
+    twitter_app_bearer: str = Field("", alias="TWITTER_APP_BEARER")
 
     github_client_id: str = Field("", alias="GITHUB_CLIENT_ID")
     github_client_secret: str = Field("", alias="GITHUB_CLIENT_SECRET")

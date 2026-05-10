@@ -15,6 +15,7 @@ COPY pyproject.toml ./
 RUN pip install --upgrade pip && pip install .
 
 COPY app ./app
+COPY shillscore ./shillscore
 COPY alembic.ini ./alembic.ini
 COPY migrations ./migrations
 

@@ -70,6 +70,7 @@ services:
       dockerfile: Dockerfile
     container_name: shillscore-web
     restart: unless-stopped
+    env_file: .env
     environment:
       NODE_ENV: production
       INTERNAL_API_URL: http://api:8000
