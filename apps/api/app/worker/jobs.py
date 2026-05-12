@@ -7,13 +7,16 @@ where possible to keep X API credit consumption bounded.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import httpx
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.clients import coingecko
 from app.clients.coingecko import CoinGeckoRateLimited
 from app.clients.twitter import AppOnlyTwitterClient, TwitterClient, refresh_access_token
 from app.config import get_settings
@@ -29,6 +32,12 @@ log = logging.getLogger(__name__)
 # shifts after we have ≥30d of mention-return data.
 MIN_LIKES = 50
 BATCH_SIZE = 25  # ≤25 from: clauses keeps the query under the 512-char cap.
+
+# When set, resolve_pending_tweets skips the per-mention on_new_mention
+# enqueue and relies on a follow-up anchor_all_pending sweep for prices.
+# Used during bulk re-runs to avoid burning N CG calls when M wide-span
+# calls (one per token) would do the job.
+SKIP_PER_MENTION_ANCHOR = os.environ.get("SHILLSCORE_SKIP_PER_MENTION_ANCHOR") == "1"
 
 # ---------- helpers ----------
 
@@ -66,6 +75,55 @@ async def _get_user_with_fresh_token() -> tuple[User, str] | None:
             await session.commit()
 
         return user, user.twitter_access_token
+
+
+async def _register_aliases_from_tweet(
+    session,
+    account_id: int,
+    tweet_id: str,
+    raw_json: dict[str, Any],
+    token_id: int,
+) -> None:
+    """After a contract-resolved mention lands, register every $TICKER that
+    co-occurred in the same tweet body as an alias from (account, symbol)
+    → token_id. Future cashtags from this account routes to this token via
+    resolver Tier 3a instead of guessing by mcap rank.
+    """
+    cashtags = parsing.extract_cashtags_only(raw_json)
+    if not cashtags:
+        return
+    for sym in cashtags:
+        await session.execute(
+            text(
+                """
+                INSERT INTO account_token_aliases
+                  (account_id, symbol, token_id, last_seen_tweet_id, updated_at)
+                VALUES (:aid, :sym, :tid, :twid, now())
+                ON CONFLICT (account_id, symbol) DO UPDATE
+                  SET token_id = EXCLUDED.token_id,
+                      last_seen_tweet_id = EXCLUDED.last_seen_tweet_id,
+                      updated_at = now()
+                """
+            ),
+            {"aid": account_id, "sym": sym, "tid": token_id, "twid": tweet_id},
+        )
+
+
+def _gran_for(start: datetime, end: datetime) -> str:
+    """CG returns minute / 5min / hourly / daily depending on the span.
+    We label the bucket so anchor lookups know which granularity to query."""
+    span = end - start
+    if span <= timedelta(hours=1):
+        return "minute"
+    if span <= timedelta(hours=24):
+        return "5min"
+    if span <= timedelta(days=90):
+        return "hourly"
+    return "daily"
+
+
+def _closest(series: list[tuple[datetime, float]], target: datetime) -> tuple[datetime, float]:
+    return min(series, key=lambda r: abs((r[0] - target).total_seconds()))
 
 
 # ---------- jobs ----------
@@ -302,11 +360,16 @@ async def resolve_pending_tweets(
     losing work already done in this job. CG outages bubble out as
     `CoinGeckoRateLimited`; the sweeper picks unresolved rows back up.
     Other resolver errors are logged on the row and the loop continues.
+
+    Three-tier ticker resolution: a `ResolveOutcome` with `token` set → normal
+    anchor-bearing mention; with `ambiguous` set → mention stored token_id=NULL
+    plus the candidate JSON for later disambiguation (no anchor job enqueued).
     """
     redis = ctx["redis"]
     resolved = 0
     skipped_rate_limited = 0
     new_mention_ids: list[int] = []
+    ambiguous_mentions = 0
 
     async with SessionLocal() as session:
         rows = (
@@ -336,28 +399,58 @@ async def resolve_pending_tweets(
 
                 tweet_mention_ids: list[int] = []
                 for m in matches:
-                    token = await resolver.resolve(m, session, redis)
-                    if not token:
-                        continue
-                    stmt = (
-                        pg_insert(Mention)
-                        .values(
+                    outcome = await resolver.resolve(
+                        m, session, redis, account_id=snap["account_id"]
+                    )
+
+                    if outcome.token is not None:
+                        # Normal resolution path — insert mention with token_id.
+                        stmt = (
+                            pg_insert(Mention)
+                            .values(
+                                account_id=snap["account_id"],
+                                tweet_id=snap["tweet_id"],
+                                tweet_ts=snap["tweet_ts"],
+                                tweet_text=snap["tweet_text"],
+                                token_id=outcome.token.id,
+                                raw_match=m.raw,
+                                match_kind=m.kind,
+                            )
+                            .on_conflict_do_nothing(constraint="u_mention")
+                            .returning(Mention.id)
+                        )
+                        mid = (await session.execute(stmt)).scalar_one_or_none()
+                        if mid is not None:
+                            tweet_mention_ids.append(mid)
+
+                        # Contract-resolved? Register every cashtag in this
+                        # tweet as an alias for this token (per-author).
+                        if m.kind == "contract":
+                            await _register_aliases_from_tweet(
+                                session,
+                                snap["account_id"],
+                                snap["tweet_id"],
+                                snap["raw_json"],
+                                outcome.token.id,
+                            )
+
+                    elif outcome.ambiguous is not None:
+                        # Ambiguous symbol — record the candidates, leave
+                        # token_id NULL. No anchor job; not counted in
+                        # leaderboard (joins on tokens).
+                        stmt = pg_insert(Mention).values(
                             account_id=snap["account_id"],
                             tweet_id=snap["tweet_id"],
                             tweet_ts=snap["tweet_ts"],
                             tweet_text=snap["tweet_text"],
-                            token_id=token.id,
+                            token_id=None,
                             raw_match=m.raw,
                             match_kind=m.kind,
+                            ambiguous_candidates=outcome.ambiguous,
                         )
-                        .on_conflict_do_nothing(
-                            constraint="u_mention",
-                        )
-                        .returning(Mention.id)
-                    )
-                    mid = (await session.execute(stmt)).scalar_one_or_none()
-                    if mid is not None:
-                        tweet_mention_ids.append(mid)
+                        await session.execute(stmt)
+                        ambiguous_mentions += 1
+                    # else: no match at all — drop silently (as before).
 
                 # Mark resolved (even if zero matches — that's a valid terminal state).
                 await session.execute(
@@ -399,14 +492,17 @@ async def resolve_pending_tweets(
             except Exception:
                 log.exception("could not record resolve failure for raw_id=%s", snap["id"])
 
-    for mid in new_mention_ids:
-        await redis.enqueue_job("on_new_mention", mid)
+    if not SKIP_PER_MENTION_ANCHOR:
+        for mid in new_mention_ids:
+            await redis.enqueue_job("on_new_mention", mid)
 
     return {
         "input": len(raw_tweet_ids),
         "resolved": resolved,
         "rate_limited": skipped_rate_limited,
         "mentions_inserted": len(new_mention_ids),
+        "ambiguous_inserted": ambiguous_mentions,
+        "per_mention_anchor_skipped": SKIP_PER_MENTION_ANCHOR,
     }
 
 
@@ -441,6 +537,56 @@ async def resolve_pending_sweep(ctx: dict[str, Any]) -> dict[str, Any]:
     return {"pending": len(ids), "jobs_enqueued": enqueued}
 
 
+async def resolve_ambiguous_via_aliases(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Retroactive Tier 3a backfill.
+
+    Walks mentions where token_id IS NULL AND ambiguous_candidates IS NOT
+    NULL. For each (account_id, raw_match→symbol), check
+    account_token_aliases for a matching alias that landed *after* the
+    ambiguous mention was created. If found, attach the token and enqueue
+    on_new_mention so the anchor job runs.
+
+    Safe to run repeatedly; idempotent on already-resolved rows.
+    """
+    fixed = 0
+    enqueue_ids: list[int] = []
+    async with SessionLocal() as session:
+        # Pull pending ambiguous mentions joined to any matching alias.
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT m.id AS mention_id, a.token_id
+                    FROM mentions m
+                    JOIN account_token_aliases a
+                      ON a.account_id = m.account_id
+                     AND a.symbol = upper(regexp_replace(m.raw_match, '^\\$', ''))
+                    WHERE m.token_id IS NULL
+                      AND m.ambiguous_candidates IS NOT NULL
+                    """
+                )
+            )
+        ).all()
+        for mention_id, token_id in rows:
+            await session.execute(
+                text(
+                    "UPDATE mentions "
+                    "SET token_id = :tid, ambiguous_candidates = NULL "
+                    "WHERE id = :mid AND token_id IS NULL"
+                ),
+                {"tid": token_id, "mid": mention_id},
+            )
+            enqueue_ids.append(mention_id)
+            fixed += 1
+        await session.commit()
+
+    redis = ctx["redis"]
+    for mid in enqueue_ids:
+        await redis.enqueue_job("on_new_mention", mid)
+
+    return {"resolved_via_alias": fixed}
+
+
 async def on_new_mention(ctx: dict[str, Any], mention_id: int) -> dict[str, Any]:
     """Fetch the price window and write the anchor."""
     async with SessionLocal() as session:
@@ -461,6 +607,126 @@ async def on_new_mention(ctx: dict[str, Any], mention_id: int) -> dict[str, Any]
         await session.commit()
 
     return {"mention_id": mention_id, "anchor": "ok"}
+
+
+async def anchor_all_pending(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Bulk anchor sweep — one CG /market_chart/range call per token.
+
+    Groups un-anchored mentions by token, fetches a single wide span that
+    brackets every tweet_ts for that token, then slices the series in memory
+    to populate each mention's anchor. Idempotent: any mention already
+    anchored is skipped by the `WHERE price_at_mention IS NULL` filter, so
+    re-running just no-ops.
+
+    Use this after a bulk re-run of resolve_pending_tweets with
+    SHILLSCORE_SKIP_PER_MENTION_ANCHOR=1. For live single-tweet ingest, the
+    per-mention `on_new_mention` job still does the 5-min slab fresh-anchor.
+    """
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT m.id, m.token_id, m.tweet_ts, t.coingecko_id
+                    FROM mentions m
+                    JOIN tokens t ON t.id = m.token_id
+                    WHERE m.price_at_mention IS NULL
+                      AND t.coingecko_id IS NOT NULL
+                    ORDER BY m.token_id, m.tweet_ts
+                    """
+                )
+            )
+        ).all()
+
+    by_token: dict[tuple[int, str], list[tuple[int, datetime]]] = {}
+    for mid, tid, ts, cg_id in rows:
+        by_token.setdefault((tid, cg_id), []).append((mid, ts))
+
+    tokens_processed = 0
+    mentions_anchored = 0
+    daily_fallbacks = 0
+    misses = 0
+
+    for (token_id, cg_id), mentions in by_token.items():
+        timestamps = [t for _, t in mentions]
+        start = min(timestamps) - timedelta(hours=24)
+        end = max(timestamps) + timedelta(hours=24)
+        try:
+            series = await coingecko.market_chart_range(cg_id, start, end)
+        except CoinGeckoRateLimited:
+            log.warning(
+                "CG rate-limited mid-anchor sweep (token_id=%s); stopping", token_id
+            )
+            break
+        except Exception:
+            log.exception("anchor fetch failed for token_id=%s cg_id=%s", token_id, cg_id)
+            continue
+
+        anchor_gran = _gran_for(start, end)
+
+        # Daily fallback when the wide-span fetch returned nothing — rare but
+        # happens on illiquid / delisted tokens with sparse OHLCV history.
+        if not series:
+            try:
+                series = await coingecko.market_chart_range(
+                    cg_id,
+                    min(timestamps) - timedelta(days=2),
+                    max(timestamps) + timedelta(days=2),
+                )
+            except Exception:
+                log.exception(
+                    "anchor daily-fallback failed for token_id=%s", token_id
+                )
+                series = []
+            anchor_gran = "daily-fallback"
+            if series:
+                daily_fallbacks += 1
+
+        if not series:
+            misses += len(mentions)
+            continue
+
+        # Single transaction per token: upsert the prices once, then patch
+        # every un-anchored mention in this token group.
+        async with SessionLocal() as session:
+            await pricing._upsert_prices(
+                session,
+                token_id,
+                series,
+                "daily" if anchor_gran == "daily-fallback" else anchor_gran,
+                "coingecko",
+            )
+            for mid, mention_ts in mentions:
+                anchor_ts, anchor_px = _closest(series, mention_ts)
+                await session.execute(
+                    text(
+                        """
+                        UPDATE mentions
+                        SET price_at_mention = :px,
+                            price_at_mention_ts = :ts,
+                            price_anchor_kind = :k,
+                            price_source = 'coingecko'
+                        WHERE id = :mid AND price_at_mention IS NULL
+                        """
+                    ),
+                    {
+                        "px": Decimal(str(anchor_px)),
+                        "ts": anchor_ts,
+                        "k": anchor_gran,
+                        "mid": mid,
+                    },
+                )
+                mentions_anchored += 1
+            await session.commit()
+        tokens_processed += 1
+
+    return {
+        "tokens_processed": tokens_processed,
+        "mentions_anchored": mentions_anchored,
+        "daily_fallbacks": daily_fallbacks,
+        "misses": misses,
+        "total_tokens_seen": len(by_token),
+    }
 
 
 async def extend_token_prices_daily(
@@ -493,7 +759,9 @@ async def refresh_benchmark_prices(ctx: dict[str, Any]) -> dict[str, Any]:
 async def refresh_mention_returns(ctx: dict[str, Any]) -> dict[str, Any]:
     async with SessionLocal() as session:
         await session.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mention_returns;"))
-        await session.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY account_leaderboard;"))
+        await session.execute(
+            text("REFRESH MATERIALIZED VIEW CONCURRENTLY account_leaderboard_cohort;")
+        )
         await session.commit()
     return {"status": "refreshed"}
 
@@ -504,7 +772,6 @@ async def bootstrap_account_ci(ctx: dict[str, Any]) -> dict[str, Any]:
     Cheap enough to do nightly even at scale (cap accounts at min N=10).
     """
     import random
-    from decimal import Decimal
 
     rows_written = 0
     async with SessionLocal() as session:

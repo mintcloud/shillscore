@@ -18,6 +18,7 @@ COPY app ./app
 COPY shillscore ./shillscore
 COPY alembic.ini ./alembic.ini
 COPY migrations ./migrations
+COPY scripts ./scripts
 
 EXPOSE 8000
 

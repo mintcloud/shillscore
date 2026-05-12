@@ -1,4 +1,9 @@
-"""Async CoinGecko v3 client. Free public tier — keep request rate <= 30/min.
+"""Async CoinGecko v3 client.
+
+Demo API key (free tier, 30 req/min) is sent via the `x-cg-demo-api-key`
+header when `COINGECKO_API_KEY` is set in the environment. Without a key
+the cloud-IP throttle drops the effective ceiling to ~10–15 req/min, so
+even a free key roughly doubles throughput.
 
 Endpoints used:
 - /coins/list (id, symbol, name) — cached daily
@@ -19,10 +24,12 @@ from typing import Any
 
 import httpx
 
+from app.config import get_settings
+
 CG_BASE = "https://api.coingecko.com/api/v3"
 DEFAULT_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
-# Pacing knob for the free tier — documented 30 calls/min hard cap, but cloud
-# IPs often see ~10-15/min in practice. 4s = 15/min sustained.
+# Pacing knob. With a demo API key CG documents 30/min hard cap; we keep
+# 4s = 15/min sustained to leave headroom for retries on bursty resolves.
 _MIN_INTERVAL = 4.0  # seconds between calls
 _last_call_at: float = 0.0
 _lock = asyncio.Lock()
@@ -34,6 +41,12 @@ class CoinGeckoRateLimited(Exception):
     Callers should treat this as recoverable (CG is throttling, try later)
     rather than as a data error. The resolver-pending sweeper retries.
     """
+
+
+def _auth_headers() -> dict[str, str]:
+    """Demo-tier auth: `x-cg-demo-api-key`. Pro tier would use `x-cg-pro-api-key`."""
+    key = get_settings().coingecko_api_key
+    return {"x-cg-demo-api-key": key} if key else {}
 
 
 async def _throttle() -> None:
@@ -48,10 +61,11 @@ async def _throttle() -> None:
 
 async def _get(path: str, params: dict[str, Any] | None = None, *, retries: int = 5) -> Any:
     backoff = 5.0
+    headers = _auth_headers()
     for attempt in range(retries):
         await _throttle()
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            r = await client.get(f"{CG_BASE}{path}", params=params)
+            r = await client.get(f"{CG_BASE}{path}", params=params, headers=headers)
             if r.status_code == 429:
                 retry_after = float(r.headers.get("retry-after") or backoff)
                 await asyncio.sleep(min(retry_after, 60.0))

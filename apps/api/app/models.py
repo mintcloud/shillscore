@@ -61,7 +61,21 @@ class Mention(Base):
     price_at_mention_ts: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     price_anchor_kind: Mapped[str | None] = mapped_column(Text)
     price_source: Mapped[str | None] = mapped_column(Text)
+    ambiguous_candidates: Mapped[dict | None] = mapped_column(JSONB)
     __table_args__ = (UniqueConstraint("tweet_id", "token_id", name="u_mention"),)
+
+
+class AccountTokenAlias(Base):
+    __tablename__ = "account_token_aliases"
+    account_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True
+    )
+    symbol: Mapped[str] = mapped_column(Text, primary_key=True)
+    token_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("tokens.id", ondelete="CASCADE")
+    )
+    last_seen_tweet_id: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
 
 class TokenPrice(Base):

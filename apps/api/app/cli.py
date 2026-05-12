@@ -46,9 +46,9 @@ async def _cmd_seed(handle: str) -> int:
     print("Wait for the queue to drain, then run:")
     print("  make psql")
     print("  REFRESH MATERIALIZED VIEW mention_returns;")
-    print("  REFRESH MATERIALIZED VIEW account_leaderboard;")
-    print("  SELECT handle, n_closed, median_excess FROM account_leaderboard")
-    print("  ORDER BY median_excess DESC NULLS LAST LIMIT 25;")
+    print("  REFRESH MATERIALIZED VIEW account_leaderboard_cohort;")
+    print("  SELECT handle, n_closed, median_excess FROM account_leaderboard_cohort")
+    print("  WHERE cohort = '30d' ORDER BY median_excess DESC NULLS LAST LIMIT 25;")
     return 0
 
 

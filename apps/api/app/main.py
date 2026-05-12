@@ -6,7 +6,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.auth import twitter as twitter_auth
 from app.config import get_settings
-from app.routers import admin, health, leaderboard
+from app.routers import admin, charts, health, leaderboard
 
 settings = get_settings()
 
@@ -24,4 +24,5 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(twitter_auth.router)
 app.include_router(leaderboard.router, prefix="/api")
+app.include_router(charts.router, prefix="/api")
 app.include_router(admin.router, prefix="/api/admin")

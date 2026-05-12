@@ -31,7 +31,11 @@ class TokenMatch:
 
     def normalized(self) -> str:
         if self.kind == "ticker":
-            return self.raw.upper()
+            # The `$` is a Twitter cashtag prefix, not part of the symbol. Strip
+            # it before any DB lookup or CG search — otherwise the symbol-exact
+            # filter on /search matches only scam tokens that literally use `$X`
+            # as their CG symbol (e.g. `freetrump` symbol=`$TRUMP`).
+            return self.raw.lstrip("$").upper()
         return self.raw.lower() if self.chain == "ethereum" else self.raw
 
 
@@ -107,3 +111,22 @@ def extract_from_tweet(tweet: dict[str, Any]) -> list[TokenMatch]:
         seen_tickers.add(tag)
 
     return matches
+
+
+def extract_cashtags_only(tweet: dict[str, Any]) -> list[str]:
+    """Return cashtag symbols found in the tweet body + Twitter entities, upper-cased.
+
+    Used by alias inference: when a tweet resolves via contract address, we
+    still want to know which `$TICKER` symbols appeared in the same text so
+    we can register them as aliases for the contract's token.
+    """
+    note = (tweet.get("note_tweet") or {}).get("text")
+    body = note or tweet.get("text") or ""
+    tags: set[str] = set()
+    for m in TICKER_RE.finditer(body):
+        tags.add(m.group(1).upper())
+    for entry in (tweet.get("entities") or {}).get("cashtags") or []:
+        tag = (entry.get("tag") or "").upper()
+        if tag and _TICKER_SHAPE_RE.match(tag):
+            tags.add(tag)
+    return sorted(tags)
