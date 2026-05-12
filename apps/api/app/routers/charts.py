@@ -14,10 +14,12 @@ Two families:
       page.
 
   /api/leaderboard/token-charts
-      Token-centric small-multiples: top-N tokens by return over the cohort
-      window (measured from the *first* mention by anyone), each with its
-      indexed price line plus per-account mention markers. Survivor-biased
-      by construction — the chart is "who caught these winners", not skill.
+      Token-centric small-multiples: top-N tokens by BTC-excess return over
+      the cohort window (measured from the *first* mention by any tracked
+      account), each with its indexed price line plus per-account mention
+      markers. Top-leaderboard accounts coloured, other tracked accounts
+      greyed. Survivor-biased by construction — the chart is "who caught
+      these winners", not skill.
 """
 from __future__ import annotations
 
@@ -170,18 +172,20 @@ async def leaderboard_token_charts(
     min_n: int = Query(MIN_N, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Top-N tokens (by return over `cohort` from first mention) + the
-    mentions made by the top-`accounts_limit` leaderboard accounts on
-    each token.
+    """Top-N tokens (by BTC-excess return over `cohort` from first tracked
+    mention) + the mentions made by ALL tracked accounts on each token,
+    flagged with `is_top` for the top-`accounts_limit` leaderboard accounts.
 
     Visual goal: a small-multiples grid where each panel is one token's
-    indexed price line plus colored dots for which top account called it
-    and when (relative to token's first mention by anyone). Lets you see
-    who got there first vs late on each winner.
+    indexed price line plus dots for which tracked account called it and
+    when. Top-leaderboard accounts get coloured dots, other tracked
+    accounts get greyed dots — so the "who got there first" story stays
+    intact even when the day-0 caller isn't in the current top-N (e.g.
+    AskVenice on VVV at 90d).
     """
     horizon = _HORIZON_DAYS[cohort]
 
-    # 1. Top leaderboard accounts for this cohort.
+    # 1. Top leaderboard accounts for this cohort (for colouring + legend).
     top_acc_rows = (
         await session.execute(
             text(
@@ -198,18 +202,7 @@ async def leaderboard_token_charts(
             {"cohort": cohort, "min_n": min_n, "alimit": accounts_limit},
         )
     ).mappings().all()
-    if not top_acc_rows:
-        return {
-            "cohort": cohort,
-            "horizon_days": horizon,
-            "accounts": [],
-            "tokens": [],
-        }
-    top_acc_ids = [int(r["account_id"]) for r in top_acc_rows]
-    # Validated ints — safe to inline into SQL. asyncpg + SQLAlchemy text()
-    # doesn't have a clean array-bind path in this codebase, so we render
-    # the IN-list as a literal.
-    top_ids_sql = ",".join(str(i) for i in top_acc_ids)
+    top_acc_ids = {int(r["account_id"]) for r in top_acc_rows}
     accounts_out = [
         {
             "account_id": r["account_id"],
@@ -221,9 +214,10 @@ async def leaderboard_token_charts(
         for r in top_acc_rows
     ]
 
-    # 2. Candidate tokens: t0 = first mention BY A TOP ACCOUNT (so the chart
-    # always has a dot at day 0 — which is the point of this view). The
-    # horizon window must have closed. Pull p_t0 and p_end in the same query.
+    # 2. Candidate tokens: t0 = first mention BY ANY TRACKED account, so the
+    # chart's day-0 always reflects the actual first call (not gated on
+    # whether the first caller made the current top-N). Pull token + BTC
+    # prices at t0 and t0+horizon to compute BTC-excess return.
     candidate_rows = (
         await session.execute(
             text(
@@ -232,12 +226,10 @@ async def leaderboard_token_charts(
                   SELECT token_id, min(tweet_ts) AS t0
                   FROM mentions
                   WHERE token_id IS NOT NULL
-                    AND account_id IN ({top_ids_sql})
                   GROUP BY token_id
                 )
                 SELECT fm.token_id, fm.t0,
                        t.symbol, t.name, t.coingecko_id,
-                       -- price closest to t0 (within 2 days) from daily series
                        (
                          SELECT close_usd FROM token_prices
                          WHERE token_id = fm.token_id AND granularity='daily'
@@ -246,7 +238,6 @@ async def leaderboard_token_charts(
                          ORDER BY abs(extract(epoch FROM ts - fm.t0)) ASC
                          LIMIT 1
                        ) AS p_t0,
-                       -- price closest to t0 + horizon (within 2 days)
                        (
                          SELECT close_usd FROM token_prices
                          WHERE token_id = fm.token_id AND granularity='daily'
@@ -254,7 +245,17 @@ async def leaderboard_token_charts(
                                       AND fm.t0 + INTERVAL '{horizon} days' + INTERVAL '2 days'
                          ORDER BY abs(extract(epoch FROM ts - (fm.t0 + INTERVAL '{horizon} days'))) ASC
                          LIMIT 1
-                       ) AS p_end
+                       ) AS p_end,
+                       (
+                         SELECT close_usd FROM benchmark_prices
+                         WHERE symbol='BTC' AND ts <= fm.t0
+                         ORDER BY ts DESC LIMIT 1
+                       ) AS btc_t0,
+                       (
+                         SELECT close_usd FROM benchmark_prices
+                         WHERE symbol='BTC' AND ts <= fm.t0 + INTERVAL '{horizon} days'
+                         ORDER BY ts DESC LIMIT 1
+                       ) AS btc_end
                 FROM first_mention fm
                 JOIN tokens t ON t.id = fm.token_id
                 WHERE fm.t0 + INTERVAL '{horizon} days' < now()
@@ -268,16 +269,33 @@ async def leaderboard_token_charts(
     for r in candidate_rows:
         if r["p_t0"] is None or r["p_end"] is None:
             continue
+        if r["btc_t0"] is None or r["btc_end"] is None:
+            continue
         sym = (r["symbol"] or "").upper()
         if sym in _STABLECOIN_SYMBOLS:
             continue
+        # Don't show BTC itself — by definition 0% excess.
+        if sym == "BTC":
+            continue
         p0 = float(r["p_t0"])
         pe = float(r["p_end"])
-        if p0 <= 0:
+        btc0 = float(r["btc_t0"])
+        btce = float(r["btc_end"])
+        if p0 <= 0 or btc0 <= 0:
             continue
-        ret = pe / p0 - 1.0
-        ranked.append({"row": r, "p0": p0, "p_end": pe, "ret": ret})
-    ranked.sort(key=lambda x: x["ret"], reverse=True)
+        token_ret = pe / p0 - 1.0
+        btc_ret = btce / btc0 - 1.0
+        excess = token_ret - btc_ret
+        ranked.append(
+            {
+                "row": r,
+                "p0": p0,
+                "p_end": pe,
+                "ret": token_ret,
+                "excess": excess,
+            }
+        )
+    ranked.sort(key=lambda x: x["excess"], reverse=True)
     chosen = ranked[:limit]
     if not chosen:
         return {
@@ -287,9 +305,9 @@ async def leaderboard_token_charts(
             "tokens": [],
         }
 
-    # 3. For each chosen token, daily price series and top-account mentions.
+    # 3. For each chosen token, daily price series and ALL tracked-account
+    # mentions (top-N flagged for colouring).
     tokens_out: list[dict] = []
-    id_to_handle = {r["account_id"]: r["handle"] for r in top_acc_rows}
 
     for c in chosen:
         r = c["row"]
@@ -327,16 +345,18 @@ async def leaderboard_token_charts(
                 }
             )
 
-        # Top-account mentions inside [t0, t0 + horizon]. Each gets the
-        # captured return = (window-end-price / their_mention_price) - 1.
+        # ALL tracked-account mentions inside [t0, t0 + horizon]. The `mentions`
+        # table only contains tweets from accounts we watch, so no extra filter
+        # is needed. `is_top` flags the current top-N (coloured); others render
+        # greyed so the day-0 caller stays visible even when not in top-N.
         mention_rows = (
             await session.execute(
                 text(
-                    f"""
-                    SELECT m.account_id, m.tweet_ts, m.price_at_mention
+                    """
+                    SELECT m.account_id, a.handle, m.tweet_ts, m.price_at_mention
                     FROM mentions m
+                    JOIN accounts a ON a.id = m.account_id
                     WHERE m.token_id = :tid
-                      AND m.account_id IN ({top_ids_sql})
                       AND m.tweet_ts BETWEEN :start AND :end
                     ORDER BY m.tweet_ts ASC
                     """
@@ -355,7 +375,8 @@ async def leaderboard_token_charts(
             captured = (c["p_end"] / mp - 1.0) if mp and mp > 0 else None
             mentions_out.append(
                 {
-                    "handle": id_to_handle[m["account_id"]],
+                    "handle": m["handle"],
+                    "is_top": int(m["account_id"]) in top_acc_ids,
                     "day": round(day, 2),
                     "indexed": (mp / p0) if mp and mp > 0 else None,
                     "captured_ret": captured,
@@ -373,6 +394,7 @@ async def leaderboard_token_charts(
                 "p0": p0,
                 "p_end": c["p_end"],
                 "total_return": c["ret"],
+                "excess_return": c["excess"],
                 "series": series,
                 "mentions": mentions_out,
             }
