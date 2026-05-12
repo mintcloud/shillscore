@@ -24,10 +24,10 @@ Resolved in conversation:
 - **Macro/regime bias: excess return is primary, raw is secondary.** New `benchmark_prices` table (BTC, ETH daily). `r_365d_excess = r_365d_token − r_365d_BTC`. Leaderboard sorts on excess by default; raw is a toggle.
 - **Sample-size asymmetry: fixed shared lookback for ranking.** Adaptive deepening enriches the account detail page but *the leaderboard score uses a fixed 365d window*. Decouples "how much we know" from "what we rank on."
 - **Survivorship within the deepened set: leave it.** Self-correcting — extending lookback usually surfaces worse pre-period and *lowers* the score.
-- **Min N = 10 closed mentions to be ranked.** Below that, accounts show on detail pages with a "needs more data" badge but don't enter the leaderboard.
-- **Cohort tabs on the leaderboard:** 90d / 365d / all-time.
-- **Bootstrap CI on median return** (1000 resamples, nightly). Display ±CI on the leaderboard so noisy accounts visibly have wider error bars.
-- **Soft polish kept:** sqrt-N weight on the score (`median * sqrt(min(n,100)/100)`) to damp the "two-lucky-picks" effect.
+- **Min N = 1 closed mentions to be ranked** *(reduced from 10 on 2026-05-10 for the seed phase — sqrt-N damping below pushes low-N accounts to the bottom of the sort, so they're visible but not credibly ranked. Tighten back when we have multi-user volume).*
+- **Cohort tabs on the leaderboard:** 30d / 90d / 365d. **30d is the default** — seed mentions are too recent for 90d/365d to populate (oldest is 2026-02-08).
+- **Bootstrap CI on median return** (1000 resamples, nightly). Display ±CI on the leaderboard so noisy accounts visibly have wider error bars. *Today's `bootstrap_account_ci` job still computes 365d-only CIs; extend to 30d/90d once those cohorts have meaningful volume.*
+- **Soft polish kept:** sqrt-N damping on the score: `damped_score = median * sqrt(N / (N + 5))`. Implemented in `apps/api/app/routers/leaderboard.py` (k=5).
 - **`r_5min` / `r_15min` / `r_1h` are v1 free output**, not Phase 5. They drop out of the high-res anchor fetch.
 - **Open source from day 1.** Public GH repo, MIT license. GitHub login as secondary auth + profile flair.
 - **You seed it.** User #1, you eat the cold-start cost.
@@ -326,29 +326,38 @@ Plus high-res returns from the slab:
 
 ### Account leaderboard
 
-Closed mentions only — that's the only honest "did they pick winners?" number.
+Closed mentions only — that's the only honest "did they pick winners?" number. **Cohort-parameterized:** one row per (account, cohort) so the API picks 30d / 90d / 365d at query time. Migration `0004_cohort_leaderboard.py` rebuilds `mention_returns` with `r_30d_excess` / `r_90d_excess` / `r_365d_excess` plus per-cohort `is_closed_Nd` flags, then defines:
 
 ```sql
-CREATE MATERIALIZED VIEW account_leaderboard AS
-SELECT a.id, a.handle, a.display_name, a.followers_count,
-       count(*)                                  AS n_closed,
-       count(*) FILTER (WHERE r_365d_excess > 0) AS n_winners,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY r_365d_excess) AS median_excess,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY r_365d)         AS median_raw,
-       avg(r_365d_excess)                        AS mean_excess
-FROM mention_returns mr
-JOIN accounts a ON a.id = mr.account_id
-WHERE is_closed
-GROUP BY a.id
-HAVING count(*) >= 10;                           -- min N
+CREATE MATERIALIZED VIEW account_leaderboard_cohort AS
+WITH per_cohort AS (
+  -- one block per cohort, identical shape, UNION ALL'd
+  SELECT a.id AS account_id, a.handle, a.display_name, a.followers_count,
+         '30d'::text AS cohort,
+         count(*)                                              AS n_closed,
+         count(*) FILTER (WHERE r_30d_excess > 0)              AS n_winners,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY r_30d_excess) AS median_excess,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY r_30d)        AS median_raw,
+         avg(r_30d_excess)                                     AS mean_excess
+  FROM mention_returns mr
+  JOIN accounts a ON a.id = mr.account_id
+  WHERE is_closed_30d AND r_30d_excess IS NOT NULL
+  GROUP BY a.id
+  UNION ALL  -- same shape for 90d, 365d
+  ...
+);
+-- min N = 1 enforced at API time (no HAVING clause). sqrt(N/(N+5)) damping
+-- applied in apps/api/app/routers/leaderboard.py at sort time.
 ```
 
-Score (default sort): `median_excess * sqrt(min(n_closed, 100) / 100)`.
+A backwards-compat view `account_leaderboard` (regular, not materialized) selects the 365d cohort so existing callers continue to work.
+
+Damped score (default sort): `median_excess * sqrt(N / (N + 5))`. Constant `DAMP_K = 5` lives in the API router; tighten as the dataset grows.
 
 UI:
-- Default tab: **365d cohort** sorted on excess return.
-- Other tabs: 90d cohort, all-time.
-- ±CI from `bootstrap_account_ci` shown as error bars on every row.
+- Default tab: **30d cohort** sorted on excess return *(was 365d in the original spec; switched 2026-05-10 because no seed mention is 365d old yet)*.
+- Other tabs: 90d cohort, 365d cohort.
+- ±CI from `bootstrap_account_ci` shown when present (365d only today).
 - Toggle: "show raw return" swaps `median_excess` → `median_raw`.
 
 In-window mentions (`NOT is_closed`) are surfaced on the *account detail page* with `r_open`, labelled "still open." They never feed the leaderboard.
@@ -425,19 +434,21 @@ Decisions log in §0 above is the canonical record. ADRs are added going forward
 - Worker: `sync_account` → `mentions` rows.
 - Worker: `on_new_mention` (priority-queued, 5-min vs hourly window).
 - Worker: `extend_token_prices_daily`, `refresh_benchmark_prices`.
-- Daily cron: `REFRESH MATERIALIZED VIEW mention_returns`, `account_leaderboard`.
+- Daily cron: `REFRESH MATERIALIZED VIEW mention_returns`, `account_leaderboard_cohort`.
 - Nightly: `bootstrap_account_ci`.
 - CLI: `python -m shillscore seed --user theogonella` runs end-to-end on your follows.
 - Acceptance: SQL query against `account_leaderboard` returns sorted accounts with CIs.
 
-### Phase 2 — public leaderboard UI (weekend 2)
+### Phase 2 — public leaderboard UI (build started 2026-05-10)
 
-- Next.js `/` — global leaderboard, ISR daily. Cohort tabs (365d default). Excess return primary.
-- `/account/[handle]` — every mention with the **price chart** (high-res slab + daily afterward, anchor marker).
-- `/mention/[id]` — chart + tweet quote + open/closed status.
+- Next.js `/` — global leaderboard, ISR 60s. Cohort tabs (**30d default**). Excess return primary.
+- `/account/[handle]` — every mention with returns at every horizon (open mentions labelled).
+- `/mention/[id]` — inline-SVG price chart + tweet quote + open/closed status. 5-min slab and daily share the same series; chart just plots whatever's stored.
 - No login required.
-- Dark theme, Geist or Inter, no decoration.
-- Acceptance: stranger sees real data without logging in; charts plot correctly with the 5-min slab visible around fresh mentions.
+- Dark theme, Geist (already wired in `apps/web/tailwind.config.ts`).
+- Built endpoints: `/api/leaderboard?cohort=&sort=`, `/api/account/{handle}`, `/api/mention/{id}`, `/api/mention/{id}/series`.
+- **Deferred from spec (intentional, Phase 2.5):** ±CI error bars in the leaderboard table — `account_ci` only stores 365d today, and the default tab is 30d. Wire CI bars when `bootstrap_account_ci` is extended to per-cohort.
+- Acceptance: stranger lands on `/`, sees the 30d table populated from seed data, can drill `account → mention → price chart`. Validate locally via `make migrate && make rebuild` then hit `https://<host>/`.
 
 ### Phase 3 — second user + network-effect plumbing (weekend 3)
 
