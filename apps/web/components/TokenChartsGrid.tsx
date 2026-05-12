@@ -22,6 +22,8 @@ function fmtDate(iso: string): string {
 
 type Props = { data: TokenChartsResponse };
 
+const OFF_TOP_COLOR = "#7a7f8a"; // greyed dot for tracked accounts outside top-N
+
 export function TokenChartsGrid({ data }: Props) {
   const [hovered, setHovered] = useState<string | null>(null);
 
@@ -32,6 +34,11 @@ export function TokenChartsGrid({ data }: Props) {
     );
     return m;
   }, [data.accounts]);
+
+  const topHandles = useMemo(
+    () => new Set(data.accounts.map((a) => a.handle)),
+    [data.accounts],
+  );
 
   if (data.tokens.length === 0) {
     return (
@@ -48,18 +55,19 @@ export function TokenChartsGrid({ data }: Props) {
           who caught the {data.cohort} winners
         </h2>
         <p className="text-xs text-muted">
-          top {data.tokens.length} tokens by return over {data.horizon_days}d ·
-          dots = top-{data.accounts.length} accounts&apos; mentions
+          top {data.tokens.length} tokens by BTC-excess return over{" "}
+          {data.horizon_days}d · coloured dots = top-{data.accounts.length}{" "}
+          accounts · grey dots = other tracked accounts
         </p>
       </div>
 
       <p className="text-[11px] text-muted">
         <span className="text-amber-300">Survivor-biased by design.</span>{" "}
-        Each panel was selected <em>because</em> the token ended the window up
-        — so any dot looks good. The interesting signal is <em>which</em>{" "}
-        accounts got there first vs late on each call, and how often the same
-        accounts recur across panels. Skill lives in the leaderboard table
-        below; this view is about coverage and timing.
+        Each panel was selected <em>because</em> the token beat BTC over the
+        window — so any dot looks good. The interesting signal is{" "}
+        <em>which</em> accounts got there first vs late on each call, and how
+        often the same accounts recur across panels. Skill lives in the
+        leaderboard table below; this view is about coverage and timing.
       </p>
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -69,6 +77,7 @@ export function TokenChartsGrid({ data }: Props) {
             token={t}
             horizon={data.horizon_days}
             handleToColor={handleToColor}
+            topHandles={topHandles}
             hovered={hovered}
           />
         ))}
@@ -133,6 +142,17 @@ export function TokenChartsGrid({ data }: Props) {
             })}
           </tbody>
         </table>
+        <div className="border-t border-white/[0.06] px-2 py-1.5 text-[10px] text-muted">
+          <span className="inline-flex items-center gap-1.5">
+            <span
+              className="inline-block h-2 w-2 rounded-full"
+              style={{ background: OFF_TOP_COLOR }}
+            />
+            grey dots = other tracked accounts (below the {data.cohort} top-
+            {data.accounts.length} cut), shown so the actual day-0 caller
+            stays visible
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -154,13 +174,19 @@ function TokenPanel({
   token,
   horizon,
   handleToColor,
+  topHandles,
   hovered,
 }: {
   token: TokenChartsToken;
   horizon: number;
   handleToColor: Map<string, string>;
+  topHandles: Set<string>;
   hovered: string | null;
 }) {
+  const colorFor = (handle: string) =>
+    topHandles.has(handle)
+      ? (handleToColor.get(handle) ?? OFF_TOP_COLOR)
+      : OFF_TOP_COLOR;
   const wrapRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(280);
   const [hoverDay, setHoverDay] = useState<number | null>(null);
@@ -242,11 +268,14 @@ function TokenPanel({
   // Y ticks — 3 lines: yMin, mid, yMax
   const yTicks = [yMin, (yMin + yMax) / 2, yMax];
 
-  // Sort scatter handles so dimmed ones render below active.
+  // Scatter handle z-order: hovered on top; otherwise grey (non-top) below
+  // top-N so the coloured dots win on overlapping days.
   const handlesSorted = [...byHandle.keys()].sort((a, b) => {
     if (a === hovered) return 1;
     if (b === hovered) return -1;
-    return 0;
+    const at = topHandles.has(a) ? 1 : 0;
+    const bt = topHandles.has(b) ? 1 : 0;
+    return at - bt;
   });
 
   function onMove(e: React.MouseEvent<HTMLDivElement>) {
@@ -287,8 +316,18 @@ function TokenPanel({
     return { indexed, dots, day: hoverDay };
   }, [hoverDay, lineDays, dayValues, byHandle]);
 
-  const totalRetPos = token.total_return >= 0;
-  const totalRetClass = totalRetPos ? "text-emerald-400" : "text-rose-400";
+  const excessPos = token.excess_return >= 0;
+  const excessClass = excessPos ? "text-emerald-400" : "text-rose-400";
+  const legendHandles = useMemo(
+    () =>
+      [...byHandle.keys()].sort((a, b) => {
+        const at = topHandles.has(a);
+        const bt = topHandles.has(b);
+        if (at !== bt) return at ? -1 : 1;
+        return a.localeCompare(b);
+      }),
+    [byHandle, topHandles],
+  );
 
   return (
     <div className="rounded-lg border border-white/10 bg-surface p-3">
@@ -304,21 +343,32 @@ function TokenPanel({
             t0 {fmtDate(token.t0_ts)} · {horizon}d window
           </div>
         </div>
-        <div className={`text-sm font-semibold tabular-nums ${totalRetClass}`}>
-          {fmtPct(token.total_return, 0)}
+        <div className="text-right">
+          <div
+            className={`text-sm font-semibold tabular-nums ${excessClass}`}
+            title="BTC-excess return — the ranking criterion"
+          >
+            {fmtPct(token.excess_return, 0)}{" "}
+            <span className="text-[9px] font-normal text-muted">vs BTC</span>
+          </div>
+          <div className="text-[10px] tabular-nums text-muted">
+            {fmtPct(token.total_return, 0)} raw
+          </div>
         </div>
       </div>
 
-      {/* Per-chart legend: which top accounts have dots on this panel. */}
+      {/* Per-chart legend: which tracked accounts have dots on this panel.
+          Top-N coloured, others greyed. */}
       {byHandle.size > 0 ? (
         <div className="mb-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] leading-tight">
-          {[...byHandle.keys()].map((h) => {
-            const color = handleToColor.get(h) ?? "#9aa0a6";
+          {legendHandles.map((h) => {
+            const color = colorFor(h);
+            const isTop = topHandles.has(h);
             const dimmed = hovered !== null && hovered !== h;
             return (
               <span
                 key={h}
-                className={`inline-flex items-center gap-1 ${dimmed ? "opacity-40" : ""}`}
+                className={`inline-flex items-center gap-1 ${dimmed ? "opacity-40" : ""} ${isTop ? "" : "opacity-70"}`}
               >
                 <span
                   className="inline-block h-1.5 w-1.5 rounded-full"
@@ -438,13 +488,15 @@ function TokenPanel({
             />
           ) : null}
 
-          {/* Mention dots */}
+          {/* Mention dots. Grey (non-top) render first/below so top-N
+              coloured dots win z-order on overlapping days. */}
           {handlesSorted.map((h) => {
-            const color = handleToColor.get(h) ?? "#9aa0a6";
+            const color = colorFor(h);
+            const isTop = topHandles.has(h);
             const dimmed = hovered !== null && hovered !== h;
             const arr = byHandle.get(h) ?? [];
             return (
-              <g key={h} opacity={dimmed ? 0.25 : 1}>
+              <g key={h} opacity={dimmed ? 0.25 : isTop ? 1 : 0.7}>
                 {arr.map((p, i) => (
                   <circle
                     key={i}
@@ -484,11 +536,12 @@ function TokenPanel({
               <>
                 <ul className="space-y-0.5 tabular-nums">
                   {tooltip.dots.map((d, i) => {
-                    const color = handleToColor.get(d.handle) ?? "#9aa0a6";
+                    const color = colorFor(d.handle);
+                    const isTop = topHandles.has(d.handle);
                     return (
                       <li
                         key={`${d.handle}-${i}`}
-                        className="flex items-center gap-1.5"
+                        className={`flex items-center gap-1.5 ${isTop ? "" : "opacity-70"}`}
                       >
                         <span
                           className="inline-block h-2 w-2 rounded-full"

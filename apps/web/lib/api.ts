@@ -126,6 +126,7 @@ export type MentionCurvePoint = {
 
 export type TokenChartsTokenMention = {
   handle: string;
+  is_top: boolean;
   day: number;
   indexed: number | null;
   captured_ret: number | null;
@@ -141,6 +142,7 @@ export type TokenChartsToken = {
   p0: number;
   p_end: number;
   total_return: number;
+  excess_return: number;
   series: { day: number; indexed: number }[];
   mentions: TokenChartsTokenMention[];
 };
