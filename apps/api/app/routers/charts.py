@@ -1,0 +1,533 @@
+"""Chart endpoints — power the visualizations on the home + account pages.
+
+Two families:
+
+  /api/leaderboard/equity-curves
+      Top-N accounts, each with a running-mean BTC-excess curve over calendar
+      time. The "building the statistic" view: each closed mention drags the
+      account's line up or down. Endpoint = today's score.
+
+  /api/account/{handle}/mention-curves
+      One series per mention, anchored at t0 = tweet time, expressed in
+      BTC-excess. Daily price snapshots vs the mention's price_at_mention,
+      with the BTC drift subtracted. "Spaghetti" overlay for the account
+      page.
+
+  /api/leaderboard/token-charts
+      Token-centric small-multiples: top-N tokens by return over the cohort
+      window (measured from the *first* mention by anyone), each with its
+      indexed price line plus per-account mention markers. Survivor-biased
+      by construction — the chart is "who caught these winners", not skill.
+"""
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import get_session
+
+router = APIRouter(tags=["charts"])
+
+Cohort = Literal["30d", "90d", "365d"]
+
+# Map cohort → return column to plot in the calendar-time curve.
+_EXCESS_COL = {"30d": "r_30d_excess", "90d": "r_90d_excess", "365d": "r_365d_excess"}
+_CLOSED_COL = {"30d": "is_closed_30d", "90d": "is_closed_90d", "365d": "is_closed_365d"}
+_HORIZON_DAYS = {"30d": 30, "90d": 90, "365d": 365}
+
+# Excluded from the token-charts view — by definition these don't have
+# returns to "catch", so they only crowd out real movers in the top-N.
+_STABLECOIN_SYMBOLS = {
+    "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "USDD", "GUSD",
+    "LUSD", "MIM", "FRAX", "FDUSD", "PYUSD", "USDE", "USDS", "RLUSD",
+    "SUSD", "USTC", "UST", "CRVUSD", "GHO", "SUSDE", "SFRAX", "USDX",
+    "EUSD", "USDB", "USDM", "USDY", "DOLA", "ALUSD", "MKUSD", "FEI",
+}
+
+
+def _f(v) -> float | None:
+    return float(v) if v is not None else None
+
+
+async def _running_mean_curve(
+    session: AsyncSession, account_id: int, cohort: Cohort
+) -> list[dict]:
+    """Calendar-time series of running-mean excess return for one account."""
+    excess_col = _EXCESS_COL[cohort]
+    closed_col = _CLOSED_COL[cohort]
+    rows = (
+        await session.execute(
+            text(
+                f"""
+                SELECT mr.tweet_ts, mr.{excess_col} AS x
+                FROM mention_returns mr
+                WHERE mr.account_id = :aid
+                  AND mr.{closed_col}
+                  AND mr.{excess_col} IS NOT NULL
+                ORDER BY mr.tweet_ts ASC
+                """
+            ),
+            {"aid": account_id},
+        )
+    ).mappings().all()
+
+    pts: list[dict] = []
+    total = 0.0
+    for i, r in enumerate(rows, start=1):
+        total += float(r["x"])
+        pts.append(
+            {
+                "ts": r["tweet_ts"].isoformat(),
+                "n": i,
+                "cum_mean": total / i,
+                "last_excess": float(r["x"]),
+            }
+        )
+    return pts
+
+
+@router.get("/leaderboard/equity-curves")
+async def leaderboard_equity_curves(
+    cohort: Cohort = Query("30d"),
+    limit: int = Query(10, ge=1, le=50),
+    min_n: int = Query(5, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Top-N accounts (by damped score) and each one's running-mean curve.
+
+    `min_n` filters out accounts with too few closed mentions — a 1-point
+    curve carries no visual signal. Default = 5.
+    """
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT lc.account_id, lc.handle, lc.display_name,
+                       lc.n_closed, lc.median_excess
+                FROM account_leaderboard_cohort lc
+                WHERE lc.cohort = :cohort
+                  AND lc.median_excess IS NOT NULL
+                  AND lc.n_closed >= :min_n
+                ORDER BY lc.median_excess * sqrt(lc.n_closed::float / (lc.n_closed + 5)) DESC NULLS LAST
+                LIMIT :limit
+                """
+            ),
+            {"cohort": cohort, "limit": limit, "min_n": min_n},
+        )
+    ).mappings().all()
+
+    accounts = []
+    for r in rows:
+        curve = await _running_mean_curve(session, r["account_id"], cohort)
+        if not curve:
+            continue
+        accounts.append(
+            {
+                "account_id": r["account_id"],
+                "handle": r["handle"],
+                "display_name": r["display_name"],
+                "n_closed": int(r["n_closed"] or 0),
+                "median_excess": _f(r["median_excess"]),
+                "curve": curve,
+            }
+        )
+
+    return {"cohort": cohort, "accounts": accounts}
+
+
+@router.get("/account/{handle}/equity-curve")
+async def account_equity_curve(
+    handle: str,
+    cohort: Cohort = Query("30d"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    handle = handle.lstrip("@").lower()
+    account = (
+        await session.execute(
+            text("SELECT id, handle FROM accounts WHERE lower(handle) = :h"),
+            {"h": handle},
+        )
+    ).mappings().first()
+    if not account:
+        raise HTTPException(status_code=404, detail=f"account @{handle} not found")
+    return {
+        "handle": account["handle"],
+        "cohort": cohort,
+        "curve": await _running_mean_curve(session, account["id"], cohort),
+    }
+
+
+@router.get("/leaderboard/token-charts")
+async def leaderboard_token_charts(
+    cohort: Literal["30d", "90d"] = Query("30d"),
+    limit: int = Query(9, ge=1, le=12),
+    accounts_limit: int = Query(10, ge=1, le=20),
+    min_n: int = Query(5, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Top-N tokens (by return over `cohort` from first mention) + the
+    mentions made by the top-`accounts_limit` leaderboard accounts on
+    each token.
+
+    Visual goal: a small-multiples grid where each panel is one token's
+    indexed price line plus colored dots for which top account called it
+    and when (relative to token's first mention by anyone). Lets you see
+    who got there first vs late on each winner.
+    """
+    horizon = _HORIZON_DAYS[cohort]
+
+    # 1. Top leaderboard accounts for this cohort.
+    top_acc_rows = (
+        await session.execute(
+            text(
+                """
+                SELECT account_id, handle, display_name, n_closed, median_excess
+                FROM account_leaderboard_cohort
+                WHERE cohort = :cohort
+                  AND median_excess IS NOT NULL
+                  AND n_closed >= :min_n
+                ORDER BY median_excess * sqrt(n_closed::float / (n_closed + 5)) DESC NULLS LAST
+                LIMIT :alimit
+                """
+            ),
+            {"cohort": cohort, "min_n": min_n, "alimit": accounts_limit},
+        )
+    ).mappings().all()
+    if not top_acc_rows:
+        return {
+            "cohort": cohort,
+            "horizon_days": horizon,
+            "accounts": [],
+            "tokens": [],
+        }
+    top_acc_ids = [int(r["account_id"]) for r in top_acc_rows]
+    # Validated ints — safe to inline into SQL. asyncpg + SQLAlchemy text()
+    # doesn't have a clean array-bind path in this codebase, so we render
+    # the IN-list as a literal.
+    top_ids_sql = ",".join(str(i) for i in top_acc_ids)
+    accounts_out = [
+        {
+            "account_id": r["account_id"],
+            "handle": r["handle"],
+            "display_name": r["display_name"],
+            "n_closed": int(r["n_closed"] or 0),
+            "median_excess": _f(r["median_excess"]),
+        }
+        for r in top_acc_rows
+    ]
+
+    # 2. Candidate tokens: t0 = first mention BY A TOP ACCOUNT (so the chart
+    # always has a dot at day 0 — which is the point of this view). The
+    # horizon window must have closed. Pull p_t0 and p_end in the same query.
+    candidate_rows = (
+        await session.execute(
+            text(
+                f"""
+                WITH first_mention AS (
+                  SELECT token_id, min(tweet_ts) AS t0
+                  FROM mentions
+                  WHERE token_id IS NOT NULL
+                    AND account_id IN ({top_ids_sql})
+                  GROUP BY token_id
+                )
+                SELECT fm.token_id, fm.t0,
+                       t.symbol, t.name, t.coingecko_id,
+                       -- price closest to t0 (within 2 days) from daily series
+                       (
+                         SELECT close_usd FROM token_prices
+                         WHERE token_id = fm.token_id AND granularity='daily'
+                           AND ts BETWEEN fm.t0 - INTERVAL '2 days'
+                                      AND fm.t0 + INTERVAL '2 days'
+                         ORDER BY abs(extract(epoch FROM ts - fm.t0)) ASC
+                         LIMIT 1
+                       ) AS p_t0,
+                       -- price closest to t0 + horizon (within 2 days)
+                       (
+                         SELECT close_usd FROM token_prices
+                         WHERE token_id = fm.token_id AND granularity='daily'
+                           AND ts BETWEEN fm.t0 + INTERVAL '{horizon} days' - INTERVAL '2 days'
+                                      AND fm.t0 + INTERVAL '{horizon} days' + INTERVAL '2 days'
+                         ORDER BY abs(extract(epoch FROM ts - (fm.t0 + INTERVAL '{horizon} days'))) ASC
+                         LIMIT 1
+                       ) AS p_end
+                FROM first_mention fm
+                JOIN tokens t ON t.id = fm.token_id
+                WHERE fm.t0 + INTERVAL '{horizon} days' < now()
+                """
+            ),
+            {},
+        )
+    ).mappings().all()
+
+    ranked = []
+    for r in candidate_rows:
+        if r["p_t0"] is None or r["p_end"] is None:
+            continue
+        sym = (r["symbol"] or "").upper()
+        if sym in _STABLECOIN_SYMBOLS:
+            continue
+        p0 = float(r["p_t0"])
+        pe = float(r["p_end"])
+        if p0 <= 0:
+            continue
+        ret = pe / p0 - 1.0
+        ranked.append({"row": r, "p0": p0, "p_end": pe, "ret": ret})
+    ranked.sort(key=lambda x: x["ret"], reverse=True)
+    chosen = ranked[:limit]
+    if not chosen:
+        return {
+            "cohort": cohort,
+            "horizon_days": horizon,
+            "accounts": accounts_out,
+            "tokens": [],
+        }
+
+    # 3. For each chosen token, daily price series and top-account mentions.
+    tokens_out: list[dict] = []
+    id_to_handle = {r["account_id"]: r["handle"] for r in top_acc_rows}
+
+    for c in chosen:
+        r = c["row"]
+        token_id = r["token_id"]
+        t0 = r["t0"]
+        p0 = c["p0"]
+
+        # Daily prices over the [t0, t0 + horizon] window.
+        price_rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT ts, close_usd FROM token_prices
+                    WHERE token_id = :tid AND granularity='daily'
+                      AND ts BETWEEN :start AND :end
+                    ORDER BY ts ASC
+                    """
+                ),
+                {
+                    "tid": token_id,
+                    "start": t0 - timedelta(days=1),
+                    "end": t0 + timedelta(days=horizon + 1),
+                },
+            )
+        ).mappings().all()
+        series: list[dict] = [{"day": 0.0, "indexed": 1.0}]
+        for pr in price_rows:
+            day = (pr["ts"] - t0).total_seconds() / 86400.0
+            if day < 0 or day > horizon + 0.5:
+                continue
+            series.append(
+                {
+                    "day": round(day, 2),
+                    "indexed": float(pr["close_usd"]) / p0,
+                }
+            )
+
+        # Top-account mentions inside [t0, t0 + horizon]. Each gets the
+        # captured return = (window-end-price / their_mention_price) - 1.
+        mention_rows = (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT m.account_id, m.tweet_ts, m.price_at_mention
+                    FROM mentions m
+                    WHERE m.token_id = :tid
+                      AND m.account_id IN ({top_ids_sql})
+                      AND m.tweet_ts BETWEEN :start AND :end
+                    ORDER BY m.tweet_ts ASC
+                    """
+                ),
+                {
+                    "tid": token_id,
+                    "start": t0,
+                    "end": t0 + timedelta(days=horizon),
+                },
+            )
+        ).mappings().all()
+        mentions_out: list[dict] = []
+        for m in mention_rows:
+            day = (m["tweet_ts"] - t0).total_seconds() / 86400.0
+            mp = float(m["price_at_mention"]) if m["price_at_mention"] is not None else None
+            captured = (c["p_end"] / mp - 1.0) if mp and mp > 0 else None
+            mentions_out.append(
+                {
+                    "handle": id_to_handle[m["account_id"]],
+                    "day": round(day, 2),
+                    "indexed": (mp / p0) if mp and mp > 0 else None,
+                    "captured_ret": captured,
+                    "tweet_ts": m["tweet_ts"].isoformat(),
+                }
+            )
+
+        tokens_out.append(
+            {
+                "token_id": token_id,
+                "symbol": r["symbol"],
+                "name": r["name"],
+                "coingecko_id": r["coingecko_id"],
+                "t0_ts": t0.isoformat(),
+                "p0": p0,
+                "p_end": c["p_end"],
+                "total_return": c["ret"],
+                "series": series,
+                "mentions": mentions_out,
+            }
+        )
+
+    return {
+        "cohort": cohort,
+        "horizon_days": horizon,
+        "accounts": accounts_out,
+        "tokens": tokens_out,
+    }
+
+
+@router.get("/account/{handle}/mention-curves")
+async def account_mention_curves(
+    handle: str,
+    cohort: Cohort = Query("30d"),
+    limit: int = Query(80, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """For each closed mention in the cohort, a daily BTC-excess series from
+    t0 → t0 + horizon. Anchored at (0, 0).
+    """
+    handle_lc = handle.lstrip("@").lower()
+    account = (
+        await session.execute(
+            text("SELECT id, handle FROM accounts WHERE lower(handle) = :h"),
+            {"h": handle_lc},
+        )
+    ).mappings().first()
+    if not account:
+        raise HTTPException(status_code=404, detail=f"account @{handle} not found")
+
+    horizon = _HORIZON_DAYS[cohort]
+    closed_col = _CLOSED_COL[cohort]
+    excess_col = _EXCESS_COL[cohort]
+
+    mentions = (
+        await session.execute(
+            text(
+                f"""
+                SELECT m.id, m.token_id, m.tweet_ts, m.price_at_mention,
+                       t.symbol, t.coingecko_id,
+                       mr.{excess_col} AS final_excess,
+                       mr.r_30d, mr.r_90d, mr.r_365d
+                FROM mentions m
+                LEFT JOIN tokens t ON t.id = m.token_id
+                LEFT JOIN mention_returns mr ON mr.id = m.id
+                WHERE m.account_id = :aid
+                  AND mr.{closed_col}
+                  AND mr.{excess_col} IS NOT NULL
+                  AND m.token_id IS NOT NULL
+                  AND m.price_at_mention IS NOT NULL
+                ORDER BY m.tweet_ts DESC
+                LIMIT :limit
+                """
+            ),
+            {"aid": account["id"], "limit": limit},
+        )
+    ).mappings().all()
+
+    if not mentions:
+        return {"handle": account["handle"], "cohort": cohort, "horizon_days": horizon, "mentions": []}
+
+    # Pull BTC daily anchor + horizon-day range in one shot, then group in Python.
+    earliest = min(m["tweet_ts"] for m in mentions)
+    latest = max(m["tweet_ts"] for m in mentions) + timedelta(days=horizon + 2)
+    btc_rows = (
+        await session.execute(
+            text(
+                """
+                SELECT ts, close_usd FROM benchmark_prices
+                WHERE symbol='BTC' AND ts BETWEEN :start AND :end
+                ORDER BY ts ASC
+                """
+            ),
+            {"start": earliest - timedelta(days=2), "end": latest},
+        )
+    ).mappings().all()
+    btc_by_date = {r["ts"].date(): float(r["close_usd"]) for r in btc_rows}
+
+    def _btc_at(d):
+        """Last available BTC close on-or-before date d."""
+        for back in range(0, 8):
+            v = btc_by_date.get(d - timedelta(days=back))
+            if v is not None:
+                return v
+        return None
+
+    out_mentions: list[dict] = []
+    for m in mentions:
+        p0 = float(m["price_at_mention"])
+        if p0 <= 0:
+            continue
+        t0 = m["tweet_ts"]
+        btc_t0 = _btc_at(t0.date())
+        if btc_t0 is None or btc_t0 <= 0:
+            continue
+
+        # Pull daily prices for this token's window
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT ts, close_usd FROM token_prices
+                    WHERE token_id = :tid
+                      AND granularity = 'daily'
+                      AND ts BETWEEN :start AND :end
+                    ORDER BY ts ASC
+                    """
+                ),
+                {
+                    "tid": m["token_id"],
+                    "start": t0,
+                    "end": t0 + timedelta(days=horizon + 1),
+                },
+            )
+        ).mappings().all()
+
+        points: list[dict] = []
+        # Always include the anchor at day 0.
+        points.append({"day": 0.0, "excess": 0.0, "token_ret": 0.0, "btc_ret": 0.0})
+        for r in rows:
+            ts = r["ts"]
+            day = (ts - t0).total_seconds() / 86400.0
+            if day <= 0 or day > horizon:
+                continue
+            btc_now = _btc_at(ts.date())
+            if btc_now is None:
+                continue
+            token_ret = float(r["close_usd"]) / p0 - 1.0
+            btc_ret = btc_now / btc_t0 - 1.0
+            points.append(
+                {
+                    "day": round(day, 2),
+                    "excess": token_ret - btc_ret,
+                    "token_ret": token_ret,
+                    "btc_ret": btc_ret,
+                }
+            )
+        if len(points) < 2:
+            continue
+        out_mentions.append(
+            {
+                "id": m["id"],
+                "tweet_ts": t0.isoformat(),
+                "symbol": m["symbol"],
+                "coingecko_id": m["coingecko_id"],
+                "final_excess": _f(m["final_excess"]),
+                "points": points,
+            }
+        )
+
+    return {
+        "handle": account["handle"],
+        "cohort": cohort,
+        "horizon_days": horizon,
+        "mentions": out_mentions,
+    }
