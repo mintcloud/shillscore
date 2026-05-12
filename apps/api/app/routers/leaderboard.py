@@ -26,6 +26,8 @@ router = APIRouter(tags=["leaderboard"])
 Cohort = Literal["30d", "90d", "365d"]
 Sort = Literal["excess", "raw"]
 DAMP_K = 5  # sqrt(N / (N + k)) damping constant
+MIN_N = DAMP_K  # min closed mentions to appear on leaderboard — matches DAMP_K so
+                # the data weight in damping is at least equal to the prior
 
 
 def _damp(n: int) -> float:
@@ -37,6 +39,7 @@ async def get_leaderboard(
     cohort: Cohort = Query("30d"),
     sort: Sort = Query("excess"),
     limit: int = Query(100, ge=1, le=500),
+    min_n: int = Query(MIN_N, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     sort_col = "median_excess" if sort == "excess" else "median_raw"
@@ -51,11 +54,12 @@ async def get_leaderboard(
                 FROM account_leaderboard_cohort lc
                 LEFT JOIN account_ci ci ON ci.account_id = lc.account_id
                 WHERE lc.cohort = :cohort
+                  AND lc.n_closed >= :min_n
                 ORDER BY {sort_col} DESC NULLS LAST
                 LIMIT :limit
                 """
             ),
-            {"cohort": cohort, "limit": limit},
+            {"cohort": cohort, "limit": limit, "min_n": min_n},
         )
     ).mappings().all()
 

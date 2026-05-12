@@ -29,6 +29,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
+from app.routers.leaderboard import MIN_N
 
 router = APIRouter(tags=["charts"])
 
@@ -94,7 +95,7 @@ async def _running_mean_curve(
 async def leaderboard_equity_curves(
     cohort: Cohort = Query("30d"),
     limit: int = Query(10, ge=1, le=50),
-    min_n: int = Query(5, ge=1, le=500),
+    min_n: int = Query(MIN_N, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Top-N accounts (by damped score) and each one's running-mean curve.
@@ -166,7 +167,7 @@ async def leaderboard_token_charts(
     cohort: Literal["30d", "90d"] = Query("30d"),
     limit: int = Query(9, ge=1, le=12),
     accounts_limit: int = Query(10, ge=1, le=20),
-    min_n: int = Query(5, ge=1, le=500),
+    min_n: int = Query(MIN_N, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Top-N tokens (by return over `cohort` from first mention) + the
