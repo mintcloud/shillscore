@@ -34,34 +34,96 @@ def _damp(n: int) -> float:
     return math.sqrt(n / (n + DAMP_K))
 
 
+def excluded_dominant_cte(cohort: Cohort) -> str:
+    """SQL CTE chain that aggregates per-handle stats after dropping each
+    handle's #1-most-mentioned token. Exposes a final CTE named `agg` with
+    columns matching account_leaderboard_cohort (sans `cohort`).
+    """
+    excess_col = f"r_{cohort}_excess"
+    raw_col = f"r_{cohort}"
+    closed_col = f"is_closed_{cohort}"
+    return f"""
+    WITH cohort_mentions AS (
+      SELECT mr.account_id, mr.token_id,
+             mr.{raw_col} AS r_raw, mr.{excess_col} AS r_excess
+      FROM mention_returns mr
+      WHERE mr.{closed_col} AND mr.{excess_col} IS NOT NULL
+    ),
+    token_counts AS (
+      SELECT account_id, token_id, count(*) AS cnt
+      FROM cohort_mentions
+      GROUP BY account_id, token_id
+    ),
+    dominant_token AS (
+      SELECT DISTINCT ON (account_id) account_id, token_id
+      FROM token_counts
+      ORDER BY account_id, cnt DESC, token_id
+    ),
+    filtered AS (
+      SELECT cm.account_id, cm.r_raw, cm.r_excess
+      FROM cohort_mentions cm
+      JOIN dominant_token dt ON dt.account_id = cm.account_id
+      WHERE cm.token_id != dt.token_id
+    ),
+    agg AS (
+      SELECT a.id AS account_id, a.handle, a.display_name, a.followers_count,
+             count(*) AS n_closed,
+             count(*) FILTER (WHERE f.r_excess > 0) AS n_winners,
+             percentile_cont(0.5) WITHIN GROUP (ORDER BY f.r_excess) AS median_excess,
+             percentile_cont(0.5) WITHIN GROUP (ORDER BY f.r_raw)    AS median_raw,
+             avg(f.r_excess)                                          AS mean_excess
+      FROM filtered f
+      JOIN accounts a ON a.id = f.account_id
+      GROUP BY a.id, a.handle, a.display_name, a.followers_count
+    )
+    """
+
+
 @router.get("/leaderboard")
 async def get_leaderboard(
     cohort: Cohort = Query("30d"),
     sort: Sort = Query("excess"),
     limit: int = Query(100, ge=1, le=500),
     min_n: int = Query(MIN_N, ge=1, le=500),
+    exclude_dominant_token: bool = Query(False),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     sort_col = "median_excess" if sort == "excess" else "median_raw"
-    rows = (
-        await session.execute(
-            text(
-                f"""
-                SELECT lc.account_id, lc.handle, lc.display_name, lc.followers_count,
-                       lc.n_closed, lc.n_winners,
-                       lc.median_excess, lc.median_raw, lc.mean_excess,
-                       ci.ci_low_excess, ci.ci_high_excess
-                FROM account_leaderboard_cohort lc
-                LEFT JOIN account_ci ci ON ci.account_id = lc.account_id
-                WHERE lc.cohort = :cohort
-                  AND lc.n_closed >= :min_n
-                ORDER BY {sort_col} DESC NULLS LAST
-                LIMIT :limit
-                """
-            ),
-            {"cohort": cohort, "limit": limit, "min_n": min_n},
-        )
-    ).mappings().all()
+    if exclude_dominant_token:
+        sql = f"""
+            {excluded_dominant_cte(cohort)}
+            SELECT account_id, handle, display_name, followers_count,
+                   n_closed, n_winners, median_excess, median_raw, mean_excess,
+                   NULL::double precision AS ci_low_excess,
+                   NULL::double precision AS ci_high_excess
+            FROM agg
+            WHERE n_closed >= :min_n
+            ORDER BY {sort_col} DESC NULLS LAST
+            LIMIT :limit
+        """
+        rows = (
+            await session.execute(text(sql), {"limit": limit, "min_n": min_n})
+        ).mappings().all()
+    else:
+        rows = (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT lc.account_id, lc.handle, lc.display_name, lc.followers_count,
+                           lc.n_closed, lc.n_winners,
+                           lc.median_excess, lc.median_raw, lc.mean_excess,
+                           ci.ci_low_excess, ci.ci_high_excess
+                    FROM account_leaderboard_cohort lc
+                    LEFT JOIN account_ci ci ON ci.account_id = lc.account_id
+                    WHERE lc.cohort = :cohort
+                      AND lc.n_closed >= :min_n
+                    ORDER BY {sort_col} DESC NULLS LAST
+                    LIMIT :limit
+                    """
+                ),
+                {"cohort": cohort, "limit": limit, "min_n": min_n},
+            )
+        ).mappings().all()
 
     out = []
     for r in rows:
@@ -89,7 +151,12 @@ async def get_leaderboard(
     # Re-sort by damped score so low-N accounts sink. The SQL ORDER BY pulled top
     # candidates by raw median; damping reorders within that pool.
     out.sort(key=lambda x: (x["damped_score"] is None, -(x["damped_score"] or 0)))
-    return {"cohort": cohort, "sort": sort, "rows": out}
+    return {
+        "cohort": cohort,
+        "sort": sort,
+        "exclude_dominant_token": exclude_dominant_token,
+        "rows": out,
+    }
 
 
 @router.get("/account/{handle}")

@@ -31,7 +31,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
-from app.routers.leaderboard import MIN_N
+from app.routers.leaderboard import MIN_N, excluded_dominant_cte
 
 router = APIRouter(tags=["charts"])
 
@@ -58,25 +58,42 @@ def _f(v) -> float | None:
 
 
 async def _running_mean_curve(
-    session: AsyncSession, account_id: int, cohort: Cohort
+    session: AsyncSession,
+    account_id: int,
+    cohort: Cohort,
+    exclude_dominant: bool = False,
 ) -> list[dict]:
     """Calendar-time series of running-mean excess return for one account."""
     excess_col = _EXCESS_COL[cohort]
     closed_col = _CLOSED_COL[cohort]
+    if exclude_dominant:
+        sql = f"""
+            WITH dominant AS (
+              SELECT token_id FROM mention_returns
+              WHERE account_id = :aid AND {closed_col} AND {excess_col} IS NOT NULL
+              GROUP BY token_id
+              ORDER BY count(*) DESC, token_id ASC
+              LIMIT 1
+            )
+            SELECT mr.tweet_ts, mr.{excess_col} AS x
+            FROM mention_returns mr
+            WHERE mr.account_id = :aid
+              AND mr.{closed_col}
+              AND mr.{excess_col} IS NOT NULL
+              AND mr.token_id != (SELECT token_id FROM dominant)
+            ORDER BY mr.tweet_ts ASC
+        """
+    else:
+        sql = f"""
+            SELECT mr.tweet_ts, mr.{excess_col} AS x
+            FROM mention_returns mr
+            WHERE mr.account_id = :aid
+              AND mr.{closed_col}
+              AND mr.{excess_col} IS NOT NULL
+            ORDER BY mr.tweet_ts ASC
+        """
     rows = (
-        await session.execute(
-            text(
-                f"""
-                SELECT mr.tweet_ts, mr.{excess_col} AS x
-                FROM mention_returns mr
-                WHERE mr.account_id = :aid
-                  AND mr.{closed_col}
-                  AND mr.{excess_col} IS NOT NULL
-                ORDER BY mr.tweet_ts ASC
-                """
-            ),
-            {"aid": account_id},
-        )
+        await session.execute(text(sql), {"aid": account_id})
     ).mappings().all()
 
     pts: list[dict] = []
@@ -99,6 +116,7 @@ async def leaderboard_equity_curves(
     cohort: Cohort = Query("30d"),
     limit: int = Query(10, ge=1, le=50),
     min_n: int = Query(MIN_N, ge=1, le=500),
+    exclude_dominant_token: bool = Query(False),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Top-N accounts (by damped score) and each one's running-mean curve.
@@ -106,27 +124,42 @@ async def leaderboard_equity_curves(
     `min_n` filters out accounts with too few matured calls — a 1-point
     curve carries no visual signal. Default = 5.
     """
-    rows = (
-        await session.execute(
-            text(
-                """
-                SELECT lc.account_id, lc.handle, lc.display_name,
-                       lc.n_closed, lc.median_excess
-                FROM account_leaderboard_cohort lc
-                WHERE lc.cohort = :cohort
-                  AND lc.median_excess IS NOT NULL
-                  AND lc.n_closed >= :min_n
-                ORDER BY lc.median_excess * sqrt(lc.n_closed::float / (lc.n_closed + 5)) DESC NULLS LAST
-                LIMIT :limit
-                """
-            ),
-            {"cohort": cohort, "limit": limit, "min_n": min_n},
-        )
-    ).mappings().all()
+    if exclude_dominant_token:
+        sql = f"""
+            {excluded_dominant_cte(cohort)}
+            SELECT account_id, handle, display_name, n_closed, median_excess
+            FROM agg
+            WHERE median_excess IS NOT NULL AND n_closed >= :min_n
+            ORDER BY median_excess * sqrt(n_closed::float / (n_closed + 5)) DESC NULLS LAST
+            LIMIT :limit
+        """
+        rows = (
+            await session.execute(text(sql), {"limit": limit, "min_n": min_n})
+        ).mappings().all()
+    else:
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT lc.account_id, lc.handle, lc.display_name,
+                           lc.n_closed, lc.median_excess
+                    FROM account_leaderboard_cohort lc
+                    WHERE lc.cohort = :cohort
+                      AND lc.median_excess IS NOT NULL
+                      AND lc.n_closed >= :min_n
+                    ORDER BY lc.median_excess * sqrt(lc.n_closed::float / (lc.n_closed + 5)) DESC NULLS LAST
+                    LIMIT :limit
+                    """
+                ),
+                {"cohort": cohort, "limit": limit, "min_n": min_n},
+            )
+        ).mappings().all()
 
     accounts = []
     for r in rows:
-        curve = await _running_mean_curve(session, r["account_id"], cohort)
+        curve = await _running_mean_curve(
+            session, r["account_id"], cohort, exclude_dominant=exclude_dominant_token
+        )
         if not curve:
             continue
         accounts.append(
@@ -140,7 +173,11 @@ async def leaderboard_equity_curves(
             }
         )
 
-    return {"cohort": cohort, "accounts": accounts}
+    return {
+        "cohort": cohort,
+        "exclude_dominant_token": exclude_dominant_token,
+        "accounts": accounts,
+    }
 
 
 @router.get("/account/{handle}/equity-curve")
@@ -171,6 +208,7 @@ async def leaderboard_token_charts(
     limit: int = Query(9, ge=1, le=12),
     accounts_limit: int = Query(10, ge=1, le=20),
     min_n: int = Query(MIN_N, ge=1, le=500),
+    exclude_dominant_token: bool = Query(False),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Top-N tokens (by BTC-excess return over `cohort` from first tracked
@@ -187,22 +225,37 @@ async def leaderboard_token_charts(
     horizon = _HORIZON_DAYS[cohort]
 
     # 1. Top leaderboard accounts for this cohort (for colouring + legend).
-    top_acc_rows = (
-        await session.execute(
-            text(
-                """
-                SELECT account_id, handle, display_name, n_closed, median_excess
-                FROM account_leaderboard_cohort
-                WHERE cohort = :cohort
-                  AND median_excess IS NOT NULL
-                  AND n_closed >= :min_n
-                ORDER BY median_excess * sqrt(n_closed::float / (n_closed + 5)) DESC NULLS LAST
-                LIMIT :alimit
-                """
-            ),
-            {"cohort": cohort, "min_n": min_n, "alimit": accounts_limit},
-        )
-    ).mappings().all()
+    if exclude_dominant_token:
+        top_acc_sql = f"""
+            {excluded_dominant_cte(cohort)}
+            SELECT account_id, handle, display_name, n_closed, median_excess
+            FROM agg
+            WHERE median_excess IS NOT NULL AND n_closed >= :min_n
+            ORDER BY median_excess * sqrt(n_closed::float / (n_closed + 5)) DESC NULLS LAST
+            LIMIT :alimit
+        """
+        top_acc_rows = (
+            await session.execute(
+                text(top_acc_sql), {"min_n": min_n, "alimit": accounts_limit}
+            )
+        ).mappings().all()
+    else:
+        top_acc_rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT account_id, handle, display_name, n_closed, median_excess
+                    FROM account_leaderboard_cohort
+                    WHERE cohort = :cohort
+                      AND median_excess IS NOT NULL
+                      AND n_closed >= :min_n
+                    ORDER BY median_excess * sqrt(n_closed::float / (n_closed + 5)) DESC NULLS LAST
+                    LIMIT :alimit
+                    """
+                ),
+                {"cohort": cohort, "min_n": min_n, "alimit": accounts_limit},
+            )
+        ).mappings().all()
     top_acc_ids = {int(r["account_id"]) for r in top_acc_rows}
     accounts_out = [
         {
@@ -576,6 +629,7 @@ async def account_mention_curves(
 async def account_best_call(
     handle: str,
     cohort: Cohort = Query("30d"),
+    exclude_dominant_token: bool = Query(False),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Best matured call for one handle in the given cohort, ranked by raw
@@ -600,25 +654,44 @@ async def account_best_call(
     raw_col = _RAW_COL[cohort]
     excess_col = _EXCESS_COL[cohort]
 
+    if exclude_dominant_token:
+        sql = f"""
+            WITH dominant AS (
+              SELECT token_id FROM mention_returns
+              WHERE account_id = :aid AND {closed_col} AND {excess_col} IS NOT NULL
+              GROUP BY token_id
+              ORDER BY count(*) DESC, token_id ASC
+              LIMIT 1
+            )
+            SELECT m.id, m.tweet_ts, t.symbol,
+                   mr.{raw_col} AS raw_ret,
+                   mr.{excess_col} AS excess_ret
+            FROM mentions m
+            JOIN mention_returns mr ON mr.id = m.id
+            JOIN tokens t ON t.id = m.token_id
+            WHERE m.account_id = :aid
+              AND mr.{closed_col}
+              AND mr.{raw_col} IS NOT NULL
+              AND m.token_id != (SELECT token_id FROM dominant)
+            ORDER BY mr.{raw_col} DESC
+            LIMIT 1
+        """
+    else:
+        sql = f"""
+            SELECT m.id, m.tweet_ts, t.symbol,
+                   mr.{raw_col} AS raw_ret,
+                   mr.{excess_col} AS excess_ret
+            FROM mentions m
+            JOIN mention_returns mr ON mr.id = m.id
+            JOIN tokens t ON t.id = m.token_id
+            WHERE m.account_id = :aid
+              AND mr.{closed_col}
+              AND mr.{raw_col} IS NOT NULL
+            ORDER BY mr.{raw_col} DESC
+            LIMIT 1
+        """
     row = (
-        await session.execute(
-            text(
-                f"""
-                SELECT m.id, m.tweet_ts, t.symbol,
-                       mr.{raw_col} AS raw_ret,
-                       mr.{excess_col} AS excess_ret
-                FROM mentions m
-                JOIN mention_returns mr ON mr.id = m.id
-                JOIN tokens t ON t.id = m.token_id
-                WHERE m.account_id = :aid
-                  AND mr.{closed_col}
-                  AND mr.{raw_col} IS NOT NULL
-                ORDER BY mr.{raw_col} DESC
-                LIMIT 1
-                """
-            ),
-            {"aid": account["id"]},
-        )
+        await session.execute(text(sql), {"aid": account["id"]})
     ).mappings().first()
 
     if not row:

@@ -17,9 +17,12 @@ const COHORTS: Cohort[] = ["30d", "90d", "365d"];
 function parseCohort(v: string | undefined): Cohort {
   return v === "90d" || v === "365d" ? v : "30d";
 }
+function parseScouts(v: string | undefined): boolean {
+  return v === "1" || v === "true";
+}
 
 type Params = Promise<{ handle: string }>;
-type SP = Promise<{ cohort?: string }>;
+type SP = Promise<{ cohort?: string; scouts?: string }>;
 
 export default async function AccountPage({
   params,
@@ -31,6 +34,7 @@ export default async function AccountPage({
   const { handle } = await params;
   const sp = await searchParams;
   const cohort = parseCohort(sp.cohort);
+  const scouts = parseScouts(sp.scouts);
 
   let data;
   let curvesData: Awaited<ReturnType<typeof getAccountMentionCurves>> | null = null;
@@ -52,7 +56,10 @@ export default async function AccountPage({
   return (
     <main className="mx-auto max-w-6xl px-6 py-10 space-y-6">
       <nav className="text-sm">
-        <Link href={`/?cohort=${cohort}`} className="text-accent hover:underline">
+        <Link
+          href={`/?cohort=${cohort}${scouts ? "&scouts=1" : ""}`}
+          className="text-accent hover:underline"
+        >
           ← leaderboard
         </Link>
       </nav>
@@ -73,7 +80,7 @@ export default async function AccountPage({
         {COHORTS.map((c) => (
           <Link
             key={c}
-            href={`/account/${account.handle}?cohort=${c}`}
+            href={`/account/${account.handle}?cohort=${c}${scouts ? "&scouts=1" : ""}`}
             className={`rounded-md px-3 py-1.5 border ${
               c === cohort
                 ? "border-accent bg-accent/10 text-accent"

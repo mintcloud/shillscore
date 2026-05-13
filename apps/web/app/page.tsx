@@ -29,7 +29,7 @@ const COHORT_BLURB: Record<Cohort, string> = {
     "Annual BTC-excess. Empty until 2027 — first calls won't close until then.",
 };
 
-type SP = Promise<{ cohort?: string; sort?: string }>;
+type SP = Promise<{ cohort?: string; sort?: string; scouts?: string }>;
 
 function parseCohort(v: string | undefined): Cohort {
   return v === "90d" || v === "365d" ? v : "30d";
@@ -37,11 +37,15 @@ function parseCohort(v: string | undefined): Cohort {
 function parseSort(v: string | undefined): Sort {
   return v === "raw" ? "raw" : "excess";
 }
+function parseScouts(v: string | undefined): boolean {
+  return v === "1" || v === "true";
+}
 
 export default async function LeaderboardPage({ searchParams }: { searchParams: SP }) {
   const sp = await searchParams;
   const cohort = parseCohort(sp.cohort);
   const sort = parseSort(sp.sort);
+  const scouts = parseScouts(sp.scouts);
 
   let rows = [] as Awaited<ReturnType<typeof getLeaderboard>>["rows"];
   let error: string | null = null;
@@ -53,13 +57,13 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
   const wantsTokenCharts = cohort === "30d" || cohort === "90d";
   try {
     const baseTasks = [
-      getLeaderboard(cohort, sort),
-      getLeaderboardCurves(cohort, 10),
+      getLeaderboard(cohort, sort, scouts),
+      getLeaderboardCurves(cohort, 10, scouts),
     ] as const;
     if (wantsTokenCharts) {
       const [r, c, tc] = await Promise.all([
         ...baseTasks,
-        getTokenCharts(cohort as "30d" | "90d", 9, 10),
+        getTokenCharts(cohort as "30d" | "90d", 9, 10, scouts),
       ]);
       rows = r.rows;
       curves = c;
@@ -75,7 +79,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
     const top3 = rows.slice(0, 3);
     bestCalls = await Promise.all(
       top3.map((r) =>
-        getAccountBestCall(r.handle, cohort)
+        getAccountBestCall(r.handle, cohort, scouts)
           .then((x) => x.best_call)
           .catch(() => null),
       ),
@@ -98,7 +102,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
         {COHORTS.map((c) => (
           <Link
             key={c}
-            href={`/?cohort=${c}&sort=${sort}`}
+            href={`/?cohort=${c}&sort=${sort}${scouts ? "&scouts=1" : ""}`}
             className={`rounded-md px-3 py-1.5 border ${
               c === cohort
                 ? "border-accent bg-accent/10 text-accent"
@@ -112,7 +116,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
         {SORTS.map((s) => (
           <Link
             key={s}
-            href={`/?cohort=${cohort}&sort=${s}`}
+            href={`/?cohort=${cohort}&sort=${s}${scouts ? "&scouts=1" : ""}`}
             className={`rounded-md px-3 py-1.5 border ${
               s === sort
                 ? "border-accent bg-accent/10 text-accent"
@@ -122,16 +126,39 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
             sort: {s === "excess" ? "BTC-excess" : "raw return"}
           </Link>
         ))}
+        <span className="mx-2 text-white/10">|</span>
+        <Link
+          href={`/?cohort=${cohort}&sort=${sort}${scouts ? "" : "&scouts=1"}`}
+          title={
+            scouts
+              ? "Scouts mode on — each handle's top-mentioned token is dropped from their score. Project accounts whose entire signal was their own bag fall off; diversified callers survive."
+              : "Default view — every matured call counts. Turn on Scouts mode to exclude each handle's #1 token (kills the project-account self-shill bias)."
+          }
+          className={`rounded-md px-3 py-1.5 border ${
+            scouts
+              ? "border-accent bg-accent/10 text-accent"
+              : "border-white/10 text-muted hover:text-ink hover:border-white/30"
+          }`}
+        >
+          {scouts ? "scouts: on" : "scouts: off"}
+        </Link>
       </nav>
 
       <p className="text-xs text-muted">{COHORT_BLURB[cohort]}</p>
+      {scouts ? (
+        <p className="text-xs text-accent/80">
+          Scouts mode: each handle&apos;s top-mentioned token is dropped before
+          scoring. Project accounts whose signal was their own bag disappear;
+          handles whose remaining calls are still good rise.
+        </p>
+      ) : null}
 
       {error ? (
         <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-300">
           API error: {error}
         </div>
       ) : rows.length === 0 ? (
-        <EmptyState cohort={cohort} />
+        <EmptyState cohort={cohort} scouts={scouts} />
       ) : (
         <>
           <TopAccountsPodium
@@ -145,7 +172,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
           {tokenCharts && tokenCharts.tokens.length > 0 ? (
             <TokenChartsGrid data={tokenCharts} />
           ) : null}
-          <Table rows={rows} cohort={cohort} sort={sort} />
+          <Table rows={rows} cohort={cohort} sort={sort} scouts={scouts} />
         </>
       )}
 
@@ -153,20 +180,29 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
         Damped score = median × √(N / (N + 5)). Min N = 5. Matured calls only —
         a mention matures into the {cohort} cohort once {cohort} have elapsed
         since the tweet, i.e. the {cohort} return window has finished.
+        {scouts
+          ? " Scouts mode: each handle's #1-most-mentioned token is excluded from their aggregates."
+          : null}
       </footer>
     </main>
   );
 }
 
-function EmptyState({ cohort }: { cohort: Cohort }) {
+function EmptyState({ cohort, scouts }: { cohort: Cohort; scouts: boolean }) {
   return (
     <div className="rounded-lg border border-white/10 bg-surface p-6 text-sm text-muted">
-      <p>No matured calls in the {cohort} cohort yet.</p>
+      <p>
+        No matured calls in the {cohort} cohort
+        {scouts ? " (scouts mode)" : ""} yet.
+      </p>
       {cohort === "365d" ? (
         <p className="mt-2">
           Earliest seed mention is from Feb 2026 — first 365d closes land around
           Feb 2027. Switch to{" "}
-          <Link href="/?cohort=30d&sort=excess" className="text-accent">
+          <Link
+            href={`/?cohort=30d&sort=excess${scouts ? "&scouts=1" : ""}`}
+            className="text-accent"
+          >
             30d
           </Link>
           .
@@ -174,12 +210,27 @@ function EmptyState({ cohort }: { cohort: Cohort }) {
       ) : (
         <p className="mt-2">
           Try{" "}
-          <Link href="/?cohort=30d&sort=excess" className="text-accent">
+          <Link
+            href={`/?cohort=30d&sort=excess${scouts ? "&scouts=1" : ""}`}
+            className="text-accent"
+          >
             30d
           </Link>{" "}
           — that's where current data lives.
         </p>
       )}
+      {scouts ? (
+        <p className="mt-2">
+          Or turn{" "}
+          <Link
+            href={`/?cohort=${cohort}&sort=excess`}
+            className="text-accent"
+          >
+            scouts mode off
+          </Link>{" "}
+          to see the full leaderboard.
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -188,10 +239,12 @@ function Table({
   rows,
   cohort,
   sort,
+  scouts,
 }: {
   rows: Awaited<ReturnType<typeof getLeaderboard>>["rows"];
   cohort: Cohort;
   sort: Sort;
+  scouts: boolean;
 }) {
   return (
     <div className="overflow-x-auto rounded-lg border border-white/10 bg-surface">
@@ -222,7 +275,7 @@ function Table({
                 <td className="px-3 py-2 text-right tabular-nums text-muted">{i + 1}</td>
                 <td className="px-3 py-2">
                   <Link
-                    href={`/account/${r.handle}?cohort=${cohort}`}
+                    href={`/account/${r.handle}?cohort=${cohort}${scouts ? "&scouts=1" : ""}`}
                     className="text-accent hover:underline"
                   >
                     @{r.handle}

@@ -88,7 +88,7 @@ A daily cron (`06:00–06:30 UTC`) keeps benchmarks, daily price series, and bot
 
 | Route | What it shows |
 |---|---|
-| `/` | Top-3 podium (Follow-on-X CTAs), equity-curve chart, token-charts grid ("who caught the winners"), full leaderboard table. Cohort + sort toggles drive everything. |
+| `/` | Top-3 podium (Follow-on-X CTAs), equity-curve chart, token-charts grid ("who caught the winners"), full leaderboard table. Cohort + sort + scouts toggles drive everything. `?scouts=1` drops each handle's #1-most-mentioned token before scoring, exposing the diversified callers and burying project-account self-shillers. |
 | `/account/[handle]` | Per-account stats per cohort, mention-curves chart, full mention list. |
 | `/mention/[id]` | Tweet + price chart + open/closed status across cohorts. |
 
