@@ -139,7 +139,7 @@ export function LeaderboardCurvesChart({ data }: Props) {
 
     const lines = accounts.map((a, i) => {
       const final = a.curve[a.curve.length - 1]?.cum_mean ?? 0;
-      const n = a.n_closed;
+      const n = a.n_matured;
       const median = a.median_excess;
       // damped = median * sqrt(n / (n + 5))
       const damped =

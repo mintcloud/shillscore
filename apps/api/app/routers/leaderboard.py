@@ -26,7 +26,7 @@ router = APIRouter(tags=["leaderboard"])
 Cohort = Literal["30d", "90d", "365d"]
 Sort = Literal["excess", "raw"]
 DAMP_K = 5  # sqrt(N / (N + k)) damping constant
-MIN_N = DAMP_K  # min closed mentions to appear on leaderboard — matches DAMP_K so
+MIN_N = DAMP_K  # min matured calls to appear on leaderboard — matches DAMP_K so
                 # the data weight in damping is at least equal to the prior
 
 
@@ -74,7 +74,7 @@ async def get_leaderboard(
                 "handle": r["handle"],
                 "display_name": r["display_name"],
                 "followers": r["followers_count"],
-                "n_closed": n,
+                "n_matured": n,
                 "n_winners": int(r["n_winners"] or 0),
                 "win_rate": (r["n_winners"] / n) if n else None,
                 "median_excess": float(r["median_excess"]) if r["median_excess"] is not None else None,
@@ -133,7 +133,7 @@ async def get_account(
         n = int(c["n_closed"] or 0)
         med = float(c["median_excess"]) if c["median_excess"] is not None else None
         cohort_summary[c["cohort"]] = {
-            "n_closed": n,
+            "n_matured": n,
             "n_winners": int(c["n_winners"] or 0),
             "win_rate": (c["n_winners"] / n) if n else None,
             "median_excess": med,
@@ -200,7 +200,7 @@ async def get_account(
                     "r_90d_excess": _f(m["r_90d_excess"]),
                     "r_365d_excess": _f(m["r_365d_excess"]),
                 },
-                "closed": {
+                "matured": {
                     "30d": bool(m["is_closed_30d"]) if m["is_closed_30d"] is not None else False,
                     "90d": bool(m["is_closed_90d"]) if m["is_closed_90d"] is not None else False,
                     "365d": bool(m["is_closed_365d"]) if m["is_closed_365d"] is not None else False,
@@ -269,7 +269,7 @@ async def get_mention(
             "r_90d_excess": _f(row["r_90d_excess"]),
             "r_365d_excess": _f(row["r_365d_excess"]),
         },
-        "closed": {
+        "matured": {
             "30d": bool(row["is_closed_30d"]) if row["is_closed_30d"] is not None else False,
             "90d": bool(row["is_closed_90d"]) if row["is_closed_90d"] is not None else False,
             "365d": bool(row["is_closed_365d"]) if row["is_closed_365d"] is not None else False,

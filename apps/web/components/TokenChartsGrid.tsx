@@ -43,7 +43,7 @@ export function TokenChartsGrid({ data }: Props) {
   if (data.tokens.length === 0) {
     return (
       <div className="rounded-lg border border-white/10 bg-surface p-6 text-sm text-muted">
-        No closed-window winners yet for the {data.cohort} cohort.
+        No matured winners yet for the {data.cohort} cohort.
       </div>
     );
   }
@@ -89,7 +89,12 @@ export function TokenChartsGrid({ data }: Props) {
           <thead className="bg-white/[0.03] text-[10px] uppercase tracking-wider text-muted">
             <tr>
               <th className="px-2 py-1.5 text-left">acct</th>
-              <th className="px-2 py-1.5 text-right">leaderboard n</th>
+              <th
+                className="px-2 py-1.5 text-right"
+                title={`matured calls in the ${data.cohort} cohort`}
+              >
+                matured
+              </th>
               <th
                 className="px-2 py-1.5 text-right"
                 title="median BTC-excess return — the leaderboard sort key"
@@ -124,7 +129,7 @@ export function TokenChartsGrid({ data }: Props) {
                     </span>
                   </td>
                   <td className="px-2 py-1.5 text-right tabular-nums text-muted">
-                    {a.n_closed}
+                    {a.n_matured}
                   </td>
                   <td
                     className={`px-2 py-1.5 text-right tabular-nums ${

@@ -9,7 +9,7 @@ export type LeaderboardRow = {
   handle: string;
   display_name: string | null;
   followers: number | null;
-  n_closed: number;
+  n_matured: number;
   n_winners: number;
   win_rate: number | null;
   median_excess: number | null;
@@ -44,7 +44,7 @@ export type AccountMention = {
   coingecko_id: string | null;
   contract_addr: string | null;
   returns: Returns;
-  closed: { "30d": boolean; "90d": boolean; "365d": boolean };
+  matured: { "30d": boolean; "90d": boolean; "365d": boolean };
 };
 
 export type AccountResponse = {
@@ -59,7 +59,7 @@ export type AccountResponse = {
   cohorts: Record<
     string,
     {
-      n_closed: number;
+      n_matured: number;
       n_winners: number;
       win_rate: number | null;
       median_excess: number | null;
@@ -88,7 +88,7 @@ export type MentionResponse = {
     contract_addr: string | null;
   };
   returns: Returns;
-  closed: { "30d": boolean; "90d": boolean; "365d": boolean };
+  matured: { "30d": boolean; "90d": boolean; "365d": boolean };
 };
 
 export type SeriesResponse = {
@@ -111,7 +111,7 @@ export type LeaderboardCurvesResponse = {
     account_id: number;
     handle: string;
     display_name: string | null;
-    n_closed: number;
+    n_matured: number;
     median_excess: number | null;
     curve: EquityCurvePoint[];
   }[];
@@ -154,7 +154,7 @@ export type TokenChartsResponse = {
     account_id: number;
     handle: string;
     display_name: string | null;
-    n_closed: number;
+    n_matured: number;
     median_excess: number | null;
   }[];
   tokens: TokenChartsToken[];

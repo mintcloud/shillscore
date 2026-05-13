@@ -67,7 +67,7 @@ export default async function AccountPage({ params }: { params: Params }) {
                     <span className={pctClass(s.median_excess)}>{pct(s.median_excess)}</span>
                   </div>
                   <div className="text-xs text-muted">
-                    median excess · n={s.n_closed} · win{" "}
+                    median excess · n={s.n_matured} · win{" "}
                     {s.win_rate !== null
                       ? `${(s.win_rate * 100).toFixed(0)}%`
                       : "—"}
@@ -77,7 +77,7 @@ export default async function AccountPage({ params }: { params: Params }) {
                   </div>
                 </>
               ) : (
-                <div className="text-sm text-muted">no closed mentions</div>
+                <div className="text-sm text-muted">no matured calls</div>
               )}
             </div>
           );
@@ -140,12 +140,12 @@ export default async function AccountPage({ params }: { params: Params }) {
                     <td
                       className={`px-3 py-2 text-right tabular-nums ${pctClass(m.returns.r_30d_excess)}`}
                     >
-                      {m.closed["30d"] ? pct(m.returns.r_30d_excess) : <span className="text-muted">open</span>}
+                      {m.matured["30d"] ? pct(m.returns.r_30d_excess) : <span className="text-muted">open</span>}
                     </td>
                     <td
                       className={`px-3 py-2 text-right tabular-nums ${pctClass(m.returns.r_90d_excess)}`}
                     >
-                      {m.closed["90d"] ? pct(m.returns.r_90d_excess) : <span className="text-muted">open</span>}
+                      {m.matured["90d"] ? pct(m.returns.r_90d_excess) : <span className="text-muted">open</span>}
                     </td>
                     <td className="px-3 py-2 text-xs text-muted">
                       <span className="line-clamp-1 max-w-md">{m.tweet_text}</span>

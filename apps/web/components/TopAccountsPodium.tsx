@@ -135,7 +135,7 @@ export function TopAccountsPodium({ rows, cohort, tokenCharts }: Props) {
                 </span>
               </div>
               <div className="text-[11px] text-muted">
-                damped score · n={r.n_closed}
+                damped score · n={r.n_matured}
                 {r.win_rate !== null ? ` · ${Math.round(r.win_rate * 100)}% win` : ""}
               </div>
 

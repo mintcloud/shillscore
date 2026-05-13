@@ -93,23 +93,23 @@ export default async function MentionPage({ params }: { params: Params }) {
         <Stat label="90d" value={mention.returns.r_90d} />
         <Stat
           label="30d excess"
-          value={mention.closed["30d"] ? mention.returns.r_30d_excess : null}
-          subtitle={!mention.closed["30d"] ? "open" : "vs BTC"}
+          value={mention.matured["30d"] ? mention.returns.r_30d_excess : null}
+          subtitle={!mention.matured["30d"] ? "open" : "vs BTC"}
         />
         <Stat
           label="90d excess"
-          value={mention.closed["90d"] ? mention.returns.r_90d_excess : null}
-          subtitle={!mention.closed["90d"] ? "open" : "vs BTC"}
+          value={mention.matured["90d"] ? mention.returns.r_90d_excess : null}
+          subtitle={!mention.matured["90d"] ? "open" : "vs BTC"}
         />
         <Stat
           label="365d"
-          value={mention.closed["365d"] ? mention.returns.r_365d : null}
-          subtitle={!mention.closed["365d"] ? "open" : "raw"}
+          value={mention.matured["365d"] ? mention.returns.r_365d : null}
+          subtitle={!mention.matured["365d"] ? "open" : "raw"}
         />
         <Stat
           label="365d excess"
-          value={mention.closed["365d"] ? mention.returns.r_365d_excess : null}
-          subtitle={!mention.closed["365d"] ? "open" : "vs BTC"}
+          value={mention.matured["365d"] ? mention.returns.r_365d_excess : null}
+          subtitle={!mention.matured["365d"] ? "open" : "vs BTC"}
         />
       </section>
 

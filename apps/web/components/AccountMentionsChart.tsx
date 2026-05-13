@@ -185,7 +185,7 @@ export function AccountMentionsChart({ data }: Props) {
   if (tokens.length === 0) {
     return (
       <div className="rounded-lg border border-white/10 bg-surface p-6 text-sm text-muted">
-        Not enough closed mentions with price coverage to plot for this cohort.
+        Not enough matured calls with price coverage to plot for this cohort.
       </div>
     );
   }

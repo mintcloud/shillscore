@@ -4,7 +4,7 @@ Two families:
 
   /api/leaderboard/equity-curves
       Top-N accounts, each with a running-mean BTC-excess curve over calendar
-      time. The "building the statistic" view: each closed mention drags the
+      time. The "building the statistic" view: each matured call drags the
       account's line up or down. Endpoint = today's score.
 
   /api/account/{handle}/mention-curves
@@ -102,7 +102,7 @@ async def leaderboard_equity_curves(
 ) -> dict:
     """Top-N accounts (by damped score) and each one's running-mean curve.
 
-    `min_n` filters out accounts with too few closed mentions — a 1-point
+    `min_n` filters out accounts with too few matured calls — a 1-point
     curve carries no visual signal. Default = 5.
     """
     rows = (
@@ -133,7 +133,7 @@ async def leaderboard_equity_curves(
                 "account_id": r["account_id"],
                 "handle": r["handle"],
                 "display_name": r["display_name"],
-                "n_closed": int(r["n_closed"] or 0),
+                "n_matured": int(r["n_closed"] or 0),
                 "median_excess": _f(r["median_excess"]),
                 "curve": curve,
             }
@@ -208,7 +208,7 @@ async def leaderboard_token_charts(
             "account_id": r["account_id"],
             "handle": r["handle"],
             "display_name": r["display_name"],
-            "n_closed": int(r["n_closed"] or 0),
+            "n_matured": int(r["n_closed"] or 0),
             "median_excess": _f(r["median_excess"]),
         }
         for r in top_acc_rows
@@ -415,7 +415,7 @@ async def account_mention_curves(
     limit: int = Query(80, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """For each closed mention in the cohort, a daily BTC-excess series from
+    """For each matured call in the cohort, a daily BTC-excess series from
     t0 → t0 + horizon. Anchored at (0, 0).
     """
     handle_lc = handle.lstrip("@").lower()

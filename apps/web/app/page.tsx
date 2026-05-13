@@ -45,8 +45,8 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
   let error: string | null = null;
   let curves: Awaited<ReturnType<typeof getLeaderboardCurves>> | null = null;
   let tokenCharts: TokenChartsResponse | null = null;
-  // Token-charts view only makes sense for 30d/90d — 365d has no closed
-  // windows yet (seed mentions from Feb 2026 won't close until Feb 2027).
+  // Token-charts view only makes sense for 30d/90d — 365d has no matured
+  // calls yet (seed mentions from Feb 2026 won't mature until Feb 2027).
   const wantsTokenCharts = cohort === "30d" || cohort === "90d";
   try {
     const baseTasks = [
@@ -136,9 +136,9 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
       )}
 
       <footer className="pt-6 text-xs text-muted">
-        Damped score = median × √(N / (N + 5)). Min N = 1. Closed cohorts only —
-        a mention is closed for the {cohort} cohort once {cohort} have elapsed
-        since the tweet.
+        Damped score = median × √(N / (N + 5)). Min N = 5. Matured calls only —
+        a mention matures into the {cohort} cohort once {cohort} have elapsed
+        since the tweet, i.e. the {cohort} return window has finished.
       </footer>
     </main>
   );
@@ -147,7 +147,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
 function EmptyState({ cohort }: { cohort: Cohort }) {
   return (
     <div className="rounded-lg border border-white/10 bg-surface p-6 text-sm text-muted">
-      <p>No closed mentions in the {cohort} cohort yet.</p>
+      <p>No matured calls in the {cohort} cohort yet.</p>
       {cohort === "365d" ? (
         <p className="mt-2">
           Earliest seed mention is from Feb 2026 — first 365d closes land around
@@ -186,7 +186,12 @@ function Table({
           <tr className="text-xs uppercase tracking-wider text-muted">
             <th className="px-3 py-2 text-right">#</th>
             <th className="px-3 py-2 text-left">handle</th>
-            <th className="px-3 py-2 text-right">n</th>
+            <th
+              className="px-3 py-2 text-right"
+              title={`matured calls — mentions with at least ${cohort} elapsed since the tweet`}
+            >
+              matured
+            </th>
             <th className="px-3 py-2 text-right">win %</th>
             <th className="px-3 py-2 text-right">
               median {sort === "excess" ? "excess" : "raw"}
@@ -209,7 +214,7 @@ function Table({
                     <span className="ml-2 text-muted">{r.display_name}</span>
                   ) : null}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums">{r.n_closed}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{r.n_matured}</td>
                 <td className="px-3 py-2 text-right tabular-nums">
                   {r.win_rate === null ? "—" : `${(r.win_rate * 100).toFixed(0)}%`}
                 </td>
