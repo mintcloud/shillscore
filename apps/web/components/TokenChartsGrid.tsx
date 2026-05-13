@@ -2,8 +2,10 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { TokenChartsResponse, TokenChartsToken } from "@/lib/api";
+import type { TokenChartsResponse, TokenChartsToken, TokenChartsTokenMention } from "@/lib/api";
 import { CHART_PALETTE } from "@/lib/palette";
+import { TweetEmbedCard } from "@/components/TweetEmbedCard";
+import { loadTwitterWidgets } from "@/lib/twitter-widgets";
 
 function fmtPct(v: number | null | undefined, digits = 1): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "—";
@@ -26,6 +28,21 @@ const OFF_TOP_COLOR = "#7a7f8a"; // greyed dot for tracked accounts outside top-
 
 export function TokenChartsGrid({ data }: Props) {
   const [hovered, setHovered] = useState<string | null>(null);
+
+  // Preload widgets.js once any panel mounts so the first hover doesn't
+  // pay the ~30KB script latency. Fire-and-forget; failures degrade to
+  // plain-text fallback inside the card.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const idle = (window as Window & {
+      requestIdleCallback?: (cb: () => void) => number;
+    }).requestIdleCallback;
+    const fire = () => {
+      loadTwitterWidgets().catch(() => undefined);
+    };
+    if (idle) idle(fire);
+    else setTimeout(fire, 500);
+  }, []);
 
   const handleToColor = useMemo(() => {
     const m = new Map<string, string>();
@@ -212,6 +229,13 @@ function TokenPanel({
   const innerH = HEIGHT - pad.top - pad.bottom;
 
   // Build per-day price map (key = rounded day) and per-handle scatter data.
+  // The mention objects are kept on each scatter point so the hover-card can
+  // reach the cached oEmbed HTML + plain-text fallback for that exact tweet.
+  type ScatterPt = {
+    day: number;
+    indexed: number;
+    mention: TokenChartsTokenMention;
+  };
   const { dayValues, byHandle, yMin, yMax, lineDays } = useMemo(() => {
     const dv = new Map<number, number>();
     for (const p of token.series) {
@@ -220,19 +244,11 @@ function TokenPanel({
       // Keep first occurrence — series should already be ordered
       if (!dv.has(d)) dv.set(d, p.indexed);
     }
-    const bh = new Map<
-      string,
-      { day: number; indexed: number; captured_ret: number | null; tweet_ts: string }[]
-    >();
+    const bh = new Map<string, ScatterPt[]>();
     for (const m of token.mentions) {
       if (m.indexed === null) continue;
       const arr = bh.get(m.handle) ?? [];
-      arr.push({
-        day: m.day,
-        indexed: m.indexed,
-        captured_ret: m.captured_ret,
-        tweet_ts: m.tweet_ts,
-      });
+      arr.push({ day: m.day, indexed: m.indexed, mention: m });
       bh.set(m.handle, arr);
     }
     const allY: number[] = [...dv.values()];
@@ -287,16 +303,23 @@ function TokenPanel({
     if (!wrapRef.current) return;
     const rect = wrapRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    if (x < pad.left - 4 || x > pad.left + innerW + 4) {
-      setHoverDay(null);
-      return;
-    }
+    // Don't *clear* hoverDay when the cursor is outside the chart's x-range
+    // (e.g. moved up into the tooltip card, which renders as a descendant
+    // of wrapRef and may extend beyond the chart bounds). Only the panel
+    // onMouseLeave should clear hoverDay — that way the tooltip stays
+    // interactive while the user moves into it to click a pill.
+    if (x < pad.left - 4 || x > pad.left + innerW + 4) return;
     const rawDay = ((x - pad.left) / innerW) * horizon;
     const d = Math.max(0, Math.min(horizon, Math.round(rawDay)));
     setHoverDay(d);
   }
 
   // Tooltip content at hoverDay
+  type TooltipDot = {
+    handle: string;
+    captured: number | null;
+    mention: TokenChartsTokenMention;
+  };
   const tooltip = useMemo(() => {
     if (hoverDay === null) return null;
     // Find nearest line sample at-or-before hoverDay (for the price line value)
@@ -310,16 +333,36 @@ function TokenPanel({
       nearestDay !== null ? (dayValues.get(nearestDay) as number) : null;
 
     // Mentions exactly at hoverDay (rounded match)
-    const dots: { handle: string; captured: number | null; tweet_ts: string }[] = [];
+    const dots: TooltipDot[] = [];
     for (const [handle, arr] of byHandle.entries()) {
       for (const p of arr) {
         if (Math.round(p.day) === hoverDay) {
-          dots.push({ handle, captured: p.captured_ret, tweet_ts: p.tweet_ts });
+          dots.push({ handle, captured: p.mention.captured_ret, mention: p.mention });
         }
       }
     }
     return { indexed, dots, day: hoverDay };
   }, [hoverDay, lineDays, dayValues, byHandle]);
+
+  // Which mention's embed card to render. When multiple mentions land on
+  // the same day, pin defaults to the top-leaderboard handle (else first),
+  // and the user can click another pill to switch.
+  const [pinnedHandle, setPinnedHandle] = useState<string | null>(null);
+  const activeMention = useMemo<TokenChartsTokenMention | null>(() => {
+    if (!tooltip || tooltip.dots.length === 0) return null;
+    if (pinnedHandle) {
+      const match = tooltip.dots.find((d) => d.handle === pinnedHandle);
+      if (match) return match.mention;
+    }
+    // Prefer top-N handle, else the first dot.
+    const top = tooltip.dots.find((d) => topHandles.has(d.handle));
+    return (top ?? tooltip.dots[0]).mention;
+  }, [tooltip, pinnedHandle, topHandles]);
+  useEffect(() => {
+    // Reset pin when the hovered day changes so the next hover starts
+    // from the default-pick rule rather than a stale pin.
+    setPinnedHandle(null);
+  }, [hoverDay]);
 
   const excessPos = token.excess_return >= 0;
   const excessClass = excessPos ? "text-emerald-400" : "text-rose-400";
@@ -518,67 +561,120 @@ function TokenPanel({
           })}
         </svg>
 
-        {/* HTML tooltip overlay — positioned near hover */}
+        {/* HTML tooltip overlay — positioned near hover.
+            Two modes:
+            - Tweet card: hovering a day with mention(s). Wider (340px) so
+              X's embed iframe (min ~350px) renders cleanly. Overflows the
+              panel; z-50 keeps it above neighbouring grid cells.
+            - Lightweight: hovering an empty day. Compact (140px).
+            Both are pointer-events-none so the cursor can keep moving
+            across the SVG without flicker. */}
         {tooltip && hoverDay !== null ? (
           <div
-            className="pointer-events-none absolute z-10 rounded-md border border-white/10 bg-bg/95 px-2 py-1.5 text-[11px] shadow-lg backdrop-blur"
-            style={{
-              left: Math.min(
-                xScale(hoverDay) + 8,
-                width - 160,
-              ),
-              top: 4,
-              minWidth: 140,
-            }}
+            className={
+              tooltip.dots.length > 0
+                ? "absolute z-50 rounded-lg border border-white/10 bg-bg/95 p-2 text-[11px] shadow-xl backdrop-blur"
+                : "pointer-events-none absolute z-10 rounded-md border border-white/10 bg-bg/95 px-2 py-1.5 text-[11px] shadow-lg backdrop-blur"
+            }
+            style={(() => {
+              const CARD_W = tooltip.dots.length > 0 ? 340 : 140;
+              const x = xScale(hoverDay);
+              // Prefer right of the hover line; flip if it'd run off the panel right edge.
+              const wantRight = x + 12 + CARD_W <= width + 80;
+              const left = wantRight
+                ? Math.min(x + 12, width - 40)
+                : Math.max(x - CARD_W - 12, -CARD_W + 40);
+              return {
+                left,
+                top: 4,
+                width: tooltip.dots.length > 0 ? CARD_W : undefined,
+                minWidth: tooltip.dots.length > 0 ? CARD_W : 140,
+              };
+            })()}
           >
-            <div className="mb-0.5 text-muted">
-              d{tooltip.day}
-              {tooltip.indexed !== null ? (
-                <span className="text-ink"> · {fmtIndexed(tooltip.indexed)}</span>
+            <div className="mb-1 flex items-baseline justify-between gap-2 text-muted">
+              <span>
+                d{tooltip.day}
+                {tooltip.indexed !== null ? (
+                  <span className="text-ink"> · {fmtIndexed(tooltip.indexed)}</span>
+                ) : null}
+              </span>
+              {tooltip.dots.length > 1 ? (
+                <span className="text-[9px] italic">
+                  {tooltip.dots.length} mentions
+                </span>
               ) : null}
             </div>
-            {tooltip.dots.length > 0 ? (
-              <>
-                <ul className="space-y-0.5 tabular-nums">
-                  {tooltip.dots.map((d, i) => {
-                    const color = colorFor(d.handle);
-                    const isTop = topHandles.has(d.handle);
-                    return (
-                      <li
-                        key={`${d.handle}-${i}`}
-                        className={`flex items-center gap-1.5 ${isTop ? "" : "opacity-70"}`}
-                      >
-                        <span
-                          className="inline-block h-2 w-2 rounded-full"
-                          style={{ background: color }}
-                        />
-                        <span className="text-ink">@{d.handle}</span>
-                        {typeof d.captured === "number" ? (
-                          <span
-                            className={
-                              d.captured > 0
-                                ? "ml-auto text-emerald-400"
-                                : d.captured < 0
-                                  ? "ml-auto text-rose-400"
-                                  : "ml-auto text-muted"
-                            }
-                          >
-                            {fmtPct(d.captured, 0)}
-                          </span>
-                        ) : null}
-                      </li>
-                    );
-                  })}
-                </ul>
-                <div className="mt-1 text-[9px] italic text-muted/70">
-                  % = return from mention price to window end
-                </div>
-              </>
-            ) : (
+
+            {tooltip.dots.length === 0 ? (
               <div className="text-[10px] italic text-muted/60">
                 no mention on this day
               </div>
-            )}
+            ) : null}
+
+            {tooltip.dots.length > 1 ? (
+              <ul className="mb-2 flex flex-wrap gap-1 tabular-nums">
+                {tooltip.dots.map((d) => {
+                  const color = colorFor(d.handle);
+                  const isActive = activeMention?.tweet_id === d.mention.tweet_id;
+                  const isTop = topHandles.has(d.handle);
+                  return (
+                    <button
+                      key={d.mention.tweet_id}
+                      type="button"
+                      onClick={() => setPinnedHandle(d.handle)}
+                      className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] transition ${
+                        isActive
+                          ? "border-white/40 bg-white/10"
+                          : "border-white/10 bg-transparent hover:bg-white/5"
+                      } ${isTop ? "" : "opacity-70"}`}
+                    >
+                      <span
+                        className="inline-block h-1.5 w-1.5 rounded-full"
+                        style={{ background: color }}
+                      />
+                      <span className="text-ink">@{d.handle}</span>
+                      {typeof d.captured === "number" ? (
+                        <span
+                          className={
+                            d.captured > 0
+                              ? "text-emerald-400"
+                              : d.captured < 0
+                                ? "text-rose-400"
+                                : "text-muted"
+                          }
+                        >
+                          {fmtPct(d.captured, 0)}
+                        </span>
+                      ) : null}
+                    </button>
+                  );
+                })}
+              </ul>
+            ) : null}
+
+            {activeMention ? (
+              <TweetEmbedCard
+                tweetId={activeMention.tweet_id}
+                handle={activeMention.handle}
+                oembedHtml={activeMention.oembed_html}
+                oembedError={activeMention.oembed_error}
+                tweetText={activeMention.tweet_text}
+                tweetTs={activeMention.tweet_ts}
+              />
+            ) : null}
+
+            {activeMention ? (
+              <div className="mt-1 text-[9px] italic text-muted/70">
+                {typeof activeMention.captured_ret === "number" ? (
+                  <>
+                    {fmtPct(activeMention.captured_ret, 0)} from mention to window end
+                  </>
+                ) : (
+                  <>% = return from mention price to window end</>
+                )}
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>

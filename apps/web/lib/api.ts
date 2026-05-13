@@ -131,6 +131,14 @@ export type TokenChartsTokenMention = {
   indexed: number | null;
   captured_ret: number | null;
   tweet_ts: string;
+  // Tweet details for the hover-card. `oembed_html` is the cached X embed
+  // markup (server-side cached via raw_tweets.oembed_html); `oembed_error`
+  // non-null means X told us the tweet can't be embedded (deleted/private)
+  // — render the plain `tweet_text` fallback in that case.
+  tweet_id: string;
+  tweet_text: string;
+  oembed_html: string | null;
+  oembed_error: string | null;
 };
 
 export type TokenChartsToken = {
