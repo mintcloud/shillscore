@@ -67,9 +67,9 @@ async def tweet_oembed(
         text(
             """
             UPDATE raw_tweets
-            SET oembed_html = :html,
-                oembed_fetched_at = CASE WHEN :html IS NOT NULL THEN :now ELSE oembed_fetched_at END,
-                oembed_error = :err
+            SET oembed_html = CAST(:html AS text),
+                oembed_fetched_at = CASE WHEN CAST(:html AS text) IS NOT NULL THEN :now ELSE oembed_fetched_at END,
+                oembed_error = CAST(:err AS text)
             WHERE tweet_id = :tid
             """
         ),
