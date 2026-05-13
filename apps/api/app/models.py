@@ -141,3 +141,6 @@ class RawTweet(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     resolve_attempts: Mapped[int] = mapped_column(SmallInteger, default=0)
     resolve_last_error: Mapped[str | None] = mapped_column(Text)
+    oembed_html: Mapped[str | None] = mapped_column(Text)
+    oembed_fetched_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    oembed_error: Mapped[str | None] = mapped_column(Text)

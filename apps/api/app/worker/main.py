@@ -27,6 +27,7 @@ class WorkerSettings:
         jobs.refresh_mention_returns,
         jobs.bootstrap_account_ci,
         jobs.consider_deepening,
+        jobs.fetch_oembed_pending,
     ]
     # All times UTC. Daily ops between 06:00 and 06:30; sweeper runs 2×/hour.
     # `resolve_ambiguous_via_aliases` runs hourly so new aliases learned from
@@ -38,6 +39,11 @@ class WorkerSettings:
         cron(jobs.bootstrap_account_ci, hour=6, minute=30, run_at_startup=False),
         cron(jobs.resolve_pending_sweep, minute={5, 35}, run_at_startup=False),
         cron(jobs.resolve_ambiguous_via_aliases, minute=45, run_at_startup=False),
+        # oEmbed cache warmer — every 15 min, picks newest pending first
+        # so the hover-card UI is hot for recent chart data. Endpoint is
+        # free and unauthenticated; only realistic cap is per-IP soft
+        # rate-limit, handled inside the oembed client.
+        cron(jobs.fetch_oembed_pending, minute={10, 25, 40, 55}, run_at_startup=False),
     ]
     job_timeout = 1200  # seconds — bumped from 600 after anchor_all_pending hit
     # the timeout twice during the 2026-05-11 bulk rerun; per-mention ops are

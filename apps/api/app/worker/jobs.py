@@ -18,6 +18,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.clients import coingecko
 from app.clients.coingecko import CoinGeckoRateLimited
+from app.clients.oembed import TransientOEmbedError, fetch_oembed_html
 from app.clients.twitter import AppOnlyTwitterClient, TwitterClient, refresh_access_token
 from app.config import get_settings
 from app.db import SessionLocal
@@ -338,6 +339,11 @@ async def sync_batch(
         resolve_jobs += 1
     for aid in account_ids:
         await redis.enqueue_job("consider_deepening", aid)
+
+    # Warm the oEmbed cache so the next hover lands on a real card, not a
+    # plain-text fallback. Cheap (free endpoint) and idempotent.
+    if new_raw_ids:
+        await redis.enqueue_job("fetch_oembed_pending", min(len(new_raw_ids) * 2, 200))
 
     return {
         "handles": handles,
@@ -825,6 +831,90 @@ async def bootstrap_account_ci(ctx: dict[str, Any]) -> dict[str, Any]:
             rows_written += 1
         await session.commit()
     return {"accounts_updated": rows_written}
+
+
+async def fetch_oembed_pending(
+    ctx: dict[str, Any], limit: int = 200
+) -> dict[str, Any]:
+    """Fetch publish.twitter.com/oEmbed HTML for raw_tweets that don't have
+    it cached yet. Free, unauthenticated endpoint — no X API spend.
+
+    Runs every 15 min via cron + at the end of sync_batch to keep new
+    tweets warm for the hover-card UI. Picks newest pending tweets first
+    so user-visible chart data gets cached before deep backfill.
+
+    Transient failures (rate-limit, 5xx, network) keep the row pending —
+    next sweep retries. Terminal failures (404, 403) record the error
+    string so we don't keep hammering deleted/private tweets.
+    """
+    import httpx
+
+    fetched = 0
+    terminal_errors = 0
+    transient_failures = 0
+
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT rt.tweet_id, a.handle
+                    FROM raw_tweets rt
+                    JOIN accounts a ON a.id = rt.account_id
+                    WHERE rt.oembed_html IS NULL
+                      AND rt.oembed_error IS NULL
+                    ORDER BY rt.tweet_ts DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": limit},
+            )
+        ).mappings().all()
+
+    if not rows:
+        return {"pending": 0, "fetched": 0, "terminal_errors": 0, "transient_failures": 0}
+
+    # Reuse one httpx client across the batch — connection pool + keep-alive
+    # shave latency vs opening per request. Stays well under publish.twitter.com
+    # soft per-IP limits at this concurrency (oembed.py caps internal sem=4).
+    now = datetime.now(timezone.utc)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for r in rows:
+            tweet_id = r["tweet_id"]
+            handle = r["handle"]
+            try:
+                html, err = await fetch_oembed_html(handle, tweet_id, client=client)
+            except TransientOEmbedError as e:
+                log.warning("oembed transient for tweet_id=%s: %s", tweet_id, e)
+                transient_failures += 1
+                continue
+
+            async with SessionLocal() as session:
+                await session.execute(
+                    text(
+                        """
+                        UPDATE raw_tweets
+                        SET oembed_html = :html,
+                            oembed_fetched_at = CASE WHEN :html IS NOT NULL THEN :now ELSE oembed_fetched_at END,
+                            oembed_error = :err
+                        WHERE tweet_id = :tid
+                        """
+                    ),
+                    {"html": html, "err": err, "now": now, "tid": tweet_id},
+                )
+                await session.commit()
+
+            if html is not None:
+                fetched += 1
+            else:
+                terminal_errors += 1
+
+    return {
+        "pending": len(rows),
+        "fetched": fetched,
+        "terminal_errors": terminal_errors,
+        "transient_failures": transient_failures,
+    }
 
 
 async def consider_deepening(ctx: dict[str, Any], account_id: int) -> dict[str, Any]:

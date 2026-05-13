@@ -349,13 +349,21 @@ async def leaderboard_token_charts(
         # table only contains tweets from accounts we watch, so no extra filter
         # is needed. `is_top` flags the current top-N (coloured); others render
         # greyed so the day-0 caller stays visible even when not in top-N.
+        # LEFT JOIN raw_tweets so we can ship the cached oEmbed HTML alongside
+        # each dot — frontend hands it to widgets.js for a real branded card
+        # on hover, with the plain tweet_text as instant fallback. raw_tweets
+        # row is keyed on tweet_id and shared across mentions of the same
+        # tweet (one tweet can resolve to multiple tokens).
         mention_rows = (
             await session.execute(
                 text(
                     """
-                    SELECT m.account_id, a.handle, m.tweet_ts, m.price_at_mention
+                    SELECT m.account_id, a.handle, m.tweet_ts, m.price_at_mention,
+                           m.tweet_id, m.tweet_text,
+                           rt.oembed_html, rt.oembed_error
                     FROM mentions m
                     JOIN accounts a ON a.id = m.account_id
+                    LEFT JOIN raw_tweets rt ON rt.tweet_id = m.tweet_id
                     WHERE m.token_id = :tid
                       AND m.tweet_ts BETWEEN :start AND :end
                     ORDER BY m.tweet_ts ASC
@@ -381,6 +389,13 @@ async def leaderboard_token_charts(
                     "indexed": (mp / p0) if mp and mp > 0 else None,
                     "captured_ret": captured,
                     "tweet_ts": m["tweet_ts"].isoformat(),
+                    "tweet_id": m["tweet_id"],
+                    "tweet_text": m["tweet_text"],
+                    "oembed_html": m["oembed_html"],
+                    # `oembed_error` non-null = X told us this tweet can't
+                    # embed (deleted/private/forbidden). Frontend uses it to
+                    # decide between iframe attempt vs plain-text card.
+                    "oembed_error": m["oembed_error"],
                 }
             )
 
