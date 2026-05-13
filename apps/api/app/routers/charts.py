@@ -39,6 +39,7 @@ Cohort = Literal["30d", "90d", "365d"]
 
 # Map cohort → return column to plot in the calendar-time curve.
 _EXCESS_COL = {"30d": "r_30d_excess", "90d": "r_90d_excess", "365d": "r_365d_excess"}
+_RAW_COL = {"30d": "r_30d", "90d": "r_90d", "365d": "r_365d"}
 _CLOSED_COL = {"30d": "is_closed_30d", "90d": "is_closed_90d", "365d": "is_closed_365d"}
 _HORIZON_DAYS = {"30d": 30, "90d": 90, "365d": 365}
 
@@ -568,4 +569,73 @@ async def account_mention_curves(
         "cohort": cohort,
         "horizon_days": horizon,
         "mentions": out_mentions,
+    }
+
+
+@router.get("/account/{handle}/best-call")
+async def account_best_call(
+    handle: str,
+    cohort: Cohort = Query("30d"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Best matured call for one handle in the given cohort, ranked by raw
+    cohort-horizon return (r_30d / r_90d / r_365d).
+
+    Used by the podium card on the home page so the "best call this 30d"
+    surface is the handle's actual top return — not just whatever happens to
+    appear in the curated token-charts panel. Raw (not excess) so the figure
+    reads as "the call captured +X%" — matches the magnitude users intuit.
+    """
+    handle_lc = handle.lstrip("@").lower()
+    account = (
+        await session.execute(
+            text("SELECT id, handle FROM accounts WHERE lower(handle) = :h"),
+            {"h": handle_lc},
+        )
+    ).mappings().first()
+    if not account:
+        raise HTTPException(status_code=404, detail=f"account @{handle} not found")
+
+    closed_col = _CLOSED_COL[cohort]
+    raw_col = _RAW_COL[cohort]
+    excess_col = _EXCESS_COL[cohort]
+
+    row = (
+        await session.execute(
+            text(
+                f"""
+                SELECT m.id, m.tweet_ts, t.symbol,
+                       mr.{raw_col} AS raw_ret,
+                       mr.{excess_col} AS excess_ret
+                FROM mentions m
+                JOIN mention_returns mr ON mr.id = m.id
+                JOIN tokens t ON t.id = m.token_id
+                WHERE m.account_id = :aid
+                  AND mr.{closed_col}
+                  AND mr.{raw_col} IS NOT NULL
+                ORDER BY mr.{raw_col} DESC
+                LIMIT 1
+                """
+            ),
+            {"aid": account["id"]},
+        )
+    ).mappings().first()
+
+    if not row:
+        return {
+            "handle": account["handle"],
+            "cohort": cohort,
+            "best_call": None,
+        }
+
+    return {
+        "handle": account["handle"],
+        "cohort": cohort,
+        "best_call": {
+            "mention_id": row["id"],
+            "symbol": row["symbol"],
+            "raw_ret": _f(row["raw_ret"]),
+            "excess_ret": _f(row["excess_ret"]),
+            "tweet_ts": row["tweet_ts"].isoformat(),
+        },
     }

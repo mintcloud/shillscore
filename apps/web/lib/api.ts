@@ -182,6 +182,20 @@ export type MentionCurvesResponse = {
   }[];
 };
 
+export type BestCall = {
+  mention_id: number;
+  symbol: string | null;
+  raw_ret: number | null;
+  excess_ret: number | null;
+  tweet_ts: string;
+};
+
+export type BestCallResponse = {
+  handle: string;
+  cohort: Cohort;
+  best_call: BestCall | null;
+};
+
 async function fetchJson<T>(path: string, revalidate = 60): Promise<T> {
   const res = await fetch(`${BASE}/api${path}`, { next: { revalidate } });
   if (!res.ok) {
@@ -235,6 +249,15 @@ export async function getAccountMentionCurves(
 ): Promise<MentionCurvesResponse> {
   return fetchJson(
     `/account/${encodeURIComponent(handle)}/mention-curves?cohort=${cohort}&limit=120`,
+  );
+}
+
+export async function getAccountBestCall(
+  handle: string,
+  cohort: Cohort,
+): Promise<BestCallResponse> {
+  return fetchJson(
+    `/account/${encodeURIComponent(handle)}/best-call?cohort=${cohort}`,
   );
 }
 

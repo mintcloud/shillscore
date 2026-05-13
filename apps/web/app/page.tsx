@@ -1,8 +1,10 @@
 import Link from "next/link";
 import {
+  type BestCall,
   type Cohort,
   type Sort,
   type TokenChartsResponse,
+  getAccountBestCall,
   getLeaderboard,
   getLeaderboardCurves,
   getTokenCharts,
@@ -45,6 +47,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
   let error: string | null = null;
   let curves: Awaited<ReturnType<typeof getLeaderboardCurves>> | null = null;
   let tokenCharts: TokenChartsResponse | null = null;
+  let bestCalls: (BestCall | null)[] = [];
   // Token-charts view only makes sense for 30d/90d — 365d has no matured
   // calls yet (seed mentions from Feb 2026 won't mature until Feb 2027).
   const wantsTokenCharts = cohort === "30d" || cohort === "90d";
@@ -66,6 +69,17 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
       rows = r.rows;
       curves = c;
     }
+    // Pull the actual best matured call for each top-3 handle in parallel.
+    // Using r_30d/r_90d/r_365d directly so this is independent of whatever
+    // tokens happen to populate the chart grid below.
+    const top3 = rows.slice(0, 3);
+    bestCalls = await Promise.all(
+      top3.map((r) =>
+        getAccountBestCall(r.handle, cohort)
+          .then((x) => x.best_call)
+          .catch(() => null),
+      ),
+    );
   } catch (e) {
     error = String(e);
   }
@@ -123,7 +137,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
           <TopAccountsPodium
             rows={rows}
             cohort={cohort}
-            tokenCharts={tokenCharts}
+            bestCalls={bestCalls}
           />
           {curves && curves.accounts.length > 0 ? (
             <LeaderboardCurvesChart data={curves} />
@@ -207,7 +221,10 @@ function Table({
               <tr key={r.account_id} className="hover:bg-white/[0.02]">
                 <td className="px-3 py-2 text-right tabular-nums text-muted">{i + 1}</td>
                 <td className="px-3 py-2">
-                  <Link href={`/account/${r.handle}`} className="text-accent hover:underline">
+                  <Link
+                    href={`/account/${r.handle}?cohort=${cohort}`}
+                    className="text-accent hover:underline"
+                  >
                     @{r.handle}
                   </Link>
                   {r.display_name ? (

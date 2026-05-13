@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
+  type Cohort,
   fmtDate,
   getAccount,
   getAccountMentionCurves,
@@ -11,17 +12,35 @@ import { AccountMentionsChart } from "@/components/AccountMentionsChart";
 
 export const revalidate = 60;
 
-type Params = Promise<{ handle: string }>;
+const COHORTS: Cohort[] = ["30d", "90d", "365d"];
 
-export default async function AccountPage({ params }: { params: Params }) {
+function parseCohort(v: string | undefined): Cohort {
+  return v === "90d" || v === "365d" ? v : "30d";
+}
+
+type Params = Promise<{ handle: string }>;
+type SP = Promise<{ cohort?: string }>;
+
+export default async function AccountPage({
+  params,
+  searchParams,
+}: {
+  params: Params;
+  searchParams: SP;
+}) {
   const { handle } = await params;
+  const sp = await searchParams;
+  const cohort = parseCohort(sp.cohort);
 
   let data;
   let curvesData: Awaited<ReturnType<typeof getAccountMentionCurves>> | null = null;
   try {
     [data, curvesData] = await Promise.all([
       getAccount(handle),
-      getAccountMentionCurves(handle, "30d").catch(() => null),
+      // 365d has no matured calls yet — skip the curves fetch.
+      cohort === "365d"
+        ? Promise.resolve(null)
+        : getAccountMentionCurves(handle, cohort).catch(() => null),
     ]);
   } catch (e) {
     if (String(e).includes("404")) notFound();
@@ -33,7 +52,7 @@ export default async function AccountPage({ params }: { params: Params }) {
   return (
     <main className="mx-auto max-w-6xl px-6 py-10 space-y-6">
       <nav className="text-sm">
-        <Link href="/" className="text-accent hover:underline">
+        <Link href={`/?cohort=${cohort}`} className="text-accent hover:underline">
           ← leaderboard
         </Link>
       </nav>
@@ -50,13 +69,34 @@ export default async function AccountPage({ params }: { params: Params }) {
         </p>
       </header>
 
+      <nav className="flex flex-wrap gap-2 text-sm">
+        {COHORTS.map((c) => (
+          <Link
+            key={c}
+            href={`/account/${account.handle}?cohort=${c}`}
+            className={`rounded-md px-3 py-1.5 border ${
+              c === cohort
+                ? "border-accent bg-accent/10 text-accent"
+                : "border-white/10 text-muted hover:text-ink hover:border-white/30"
+            }`}
+          >
+            {c}
+          </Link>
+        ))}
+      </nav>
+
       <section className="grid gap-3 sm:grid-cols-3">
-        {(["30d", "90d", "365d"] as const).map((c) => {
+        {COHORTS.map((c) => {
           const s = cohorts[c];
+          const isActive = c === cohort;
           return (
             <div
               key={c}
-              className="rounded-lg border border-white/10 bg-surface p-4 space-y-1"
+              className={`rounded-lg border p-4 space-y-1 ${
+                isActive
+                  ? "border-accent/50 bg-accent/[0.04]"
+                  : "border-white/10 bg-surface"
+              }`}
             >
               <div className="text-xs uppercase tracking-wider text-muted">
                 {c} cohort
@@ -88,6 +128,10 @@ export default async function AccountPage({ params }: { params: Params }) {
         <section>
           <AccountMentionsChart data={curvesData} />
         </section>
+      ) : cohort === "365d" ? (
+        <p className="text-sm text-muted">
+          No 365d-matured calls yet — seed mentions from Feb 2026 won't mature until Feb 2027.
+        </p>
       ) : null}
 
       <section className="space-y-2">

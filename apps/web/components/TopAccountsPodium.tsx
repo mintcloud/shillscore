@@ -1,17 +1,12 @@
 import Link from "next/link";
-import type {
-  Cohort,
-  LeaderboardRow,
-  TokenChartsResponse,
-} from "@/lib/api";
+import type { BestCall, Cohort, LeaderboardRow } from "@/lib/api";
 
 type Props = {
   rows: LeaderboardRow[];
   cohort: Cohort;
-  // tokenCharts is the same dataset already loaded for the small-multiples
-  // grid; we mine it to surface each top-3 account's best call by captured
-  // return without an extra API roundtrip. May be null for 365d.
-  tokenCharts: TokenChartsResponse | null;
+  // One per top-3 row, same order. Null when the handle has no matured calls
+  // in the cohort (rare — they'd not be on the leaderboard at all in that case).
+  bestCalls: (BestCall | null)[];
 };
 
 function fmtPct(v: number | null | undefined, digits = 1): string {
@@ -19,27 +14,6 @@ function fmtPct(v: number | null | undefined, digits = 1): string {
   const s = (v * 100).toFixed(digits);
   const n = Number(s);
   return `${n > 0 ? "+" : ""}${s}%`;
-}
-
-type BestCall = { symbol: string | null; ret: number; tweet_ts: string };
-
-function bestCallFor(
-  handle: string,
-  tokenCharts: TokenChartsResponse | null,
-): BestCall | null {
-  if (!tokenCharts) return null;
-  let best: BestCall | null = null;
-  for (const t of tokenCharts.tokens) {
-    for (const m of t.mentions) {
-      if (m.handle !== handle) continue;
-      const r = m.captured_ret;
-      if (r === null || !Number.isFinite(r)) continue;
-      if (!best || r > best.ret) {
-        best = { symbol: t.symbol, ret: r, tweet_ts: m.tweet_ts };
-      }
-    }
-  }
-  return best;
 }
 
 // Rank 1/2/3 visual styling. Gold/silver/bronze are tuned for the dark
@@ -82,7 +56,7 @@ const PODIUM: {
   },
 ];
 
-export function TopAccountsPodium({ rows, cohort, tokenCharts }: Props) {
+export function TopAccountsPodium({ rows, cohort, bestCalls }: Props) {
   const top = rows.slice(0, 3);
   if (top.length === 0) return null;
 
@@ -99,7 +73,7 @@ export function TopAccountsPodium({ rows, cohort, tokenCharts }: Props) {
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         {top.map((r, i) => {
           const meta = PODIUM[i];
-          const best = bestCallFor(r.handle, tokenCharts);
+          const best = bestCalls[i] ?? null;
           return (
             <div
               key={r.account_id}
@@ -116,7 +90,7 @@ export function TopAccountsPodium({ rows, cohort, tokenCharts }: Props) {
 
               <div className="mt-1 flex items-baseline justify-between gap-2">
                 <Link
-                  href={`/account/${r.handle}`}
+                  href={`/account/${r.handle}?cohort=${cohort}`}
                   className="truncate text-base font-semibold text-ink hover:text-accent hover:underline"
                   title={r.display_name ?? r.handle}
                 >
@@ -139,9 +113,15 @@ export function TopAccountsPodium({ rows, cohort, tokenCharts }: Props) {
                 {r.win_rate !== null ? ` · ${Math.round(r.win_rate * 100)}% win` : ""}
               </div>
 
-              {/* Best call within the global cohort filter */}
+              {/* Best call = highest raw cohort-horizon return among matured
+                  calls. Independent from the token-charts panel below — so
+                  consistent dip-buyers on tokens that didn't win from day-0
+                  still get a credit here. */}
               {best && best.symbol ? (
-                <div className="mt-3 rounded-md border border-white/[0.06] bg-white/[0.02] px-2 py-1.5">
+                <Link
+                  href={`/mention/${best.mention_id}`}
+                  className="mt-3 block rounded-md border border-white/[0.06] bg-white/[0.02] px-2 py-1.5 hover:border-white/15 hover:bg-white/[0.04]"
+                >
                   <div className="text-[10px] uppercase tracking-wider text-muted">
                     best call this {cohort}
                   </div>
@@ -151,21 +131,26 @@ export function TopAccountsPodium({ rows, cohort, tokenCharts }: Props) {
                     </span>
                     <span
                       className={`text-sm font-semibold tabular-nums ${
-                        best.ret > 0
+                        (best.raw_ret ?? 0) > 0
                           ? "text-emerald-400"
                           : "text-rose-400"
                       }`}
                     >
-                      {fmtPct(best.ret, 0)}
+                      {fmtPct(best.raw_ret, 0)}
                     </span>
                   </div>
                   <div className="text-[10px] text-muted">
                     called {new Date(best.tweet_ts).toISOString().slice(0, 10)}
+                    {best.excess_ret !== null ? (
+                      <span className="ml-1">
+                        · {fmtPct(best.excess_ret, 0)} vs BTC
+                      </span>
+                    ) : null}
                   </div>
-                </div>
+                </Link>
               ) : (
                 <div className="mt-3 rounded-md border border-white/[0.06] bg-white/[0.02] px-2 py-1.5 text-[11px] text-muted/70">
-                  not in the {cohort} winners panel
+                  no matured calls in {cohort}
                 </div>
               )}
 
@@ -180,7 +165,7 @@ export function TopAccountsPodium({ rows, cohort, tokenCharts }: Props) {
                   <span aria-hidden>↗</span>
                 </a>
                 <Link
-                  href={`/account/${r.handle}`}
+                  href={`/account/${r.handle}?cohort=${cohort}`}
                   className="text-[11px] text-muted hover:text-ink hover:underline"
                 >
                   view calls →
