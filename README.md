@@ -88,8 +88,8 @@ A daily cron (`06:00–06:30 UTC`) keeps benchmarks, daily price series, and bot
 
 | Route | What it shows |
 |---|---|
-| `/` | Top-3 podium (Follow-on-X CTAs), equity-curve chart, token-charts grid ("who caught the winners"), full leaderboard table. Cohort + sort + scouts toggles drive everything. `?scouts=1` drops each handle's #1-most-mentioned token before scoring, exposing the diversified callers and burying project-account self-shillers. |
-| `/account/[handle]` | Per-account stats per cohort, mention-curves chart, full mention list. |
+| `/` | Top-3 podium (Follow-on-X CTAs), equity-curve chart, token-charts grid ("who caught the winners"), full leaderboard table. Cohort + sort + scouts toggles drive everything. **Scouts mode is the default** — each handle's #1-most-mentioned token is dropped before scoring, exposing the diversified callers and burying project-account self-shillers. `?scouts=0` opts out into the raw all-calls view. |
+| `/account/[handle]` | Per-account stats per cohort (scouts-aware — toggle on the page or via `?scouts=0` to see the unfiltered view; cohort cards match the home leaderboard when scouts is on), mention-curves chart, full mention list. |
 | `/mention/[id]` | Tweet + price chart + open/closed status across cohorts. |
 
 API endpoints powering the UI: `/api/leaderboard`, `/api/leaderboard/equity-curves`, `/api/leaderboard/token-charts`, `/api/account/{handle}`, `/api/account/{handle}/mention-curves`, `/api/mention/{id}`, `/api/mention/{id}/series`.
