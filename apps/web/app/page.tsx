@@ -37,8 +37,11 @@ function parseCohort(v: string | undefined): Cohort {
 function parseSort(v: string | undefined): Sort {
   return v === "raw" ? "raw" : "excess";
 }
+// Default: scouts mode ON. Project accounts whose entire signal was their own
+// bag distort the leaderboard otherwise. Pass ?scouts=0 to see the unfiltered
+// view.
 function parseScouts(v: string | undefined): boolean {
-  return v === "1" || v === "true";
+  return v !== "0" && v !== "false";
 }
 
 export default async function LeaderboardPage({ searchParams }: { searchParams: SP }) {
@@ -102,7 +105,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
         {COHORTS.map((c) => (
           <Link
             key={c}
-            href={`/?cohort=${c}&sort=${sort}${scouts ? "&scouts=1" : ""}`}
+            href={`/?cohort=${c}&sort=${sort}${scouts ? "" : "&scouts=0"}`}
             className={`rounded-md px-3 py-1.5 border ${
               c === cohort
                 ? "border-accent bg-accent/10 text-accent"
@@ -116,7 +119,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
         {SORTS.map((s) => (
           <Link
             key={s}
-            href={`/?cohort=${cohort}&sort=${s}${scouts ? "&scouts=1" : ""}`}
+            href={`/?cohort=${cohort}&sort=${s}${scouts ? "" : "&scouts=0"}`}
             className={`rounded-md px-3 py-1.5 border ${
               s === sort
                 ? "border-accent bg-accent/10 text-accent"
@@ -128,11 +131,11 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
         ))}
         <span className="mx-2 text-white/10">|</span>
         <Link
-          href={`/?cohort=${cohort}&sort=${sort}${scouts ? "" : "&scouts=1"}`}
+          href={`/?cohort=${cohort}&sort=${sort}${scouts ? "&scouts=0" : ""}`}
           title={
             scouts
-              ? "Scouts mode on — each handle's top-mentioned token is dropped from their score. Project accounts whose entire signal was their own bag fall off; diversified callers survive."
-              : "Default view — every matured call counts. Turn on Scouts mode to exclude each handle's #1 token (kills the project-account self-shill bias)."
+              ? "Scouts mode on (default) — each handle's top-mentioned token is dropped from their score. Project accounts whose entire signal was their own bag fall off; diversified callers survive."
+              : "All-calls view — every matured call counts, including project accounts shilling their own token. Scouts mode (default) drops each handle's #1 token to kill the self-shill bias."
           }
           className={`rounded-md px-3 py-1.5 border ${
             scouts
@@ -147,11 +150,18 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
       <p className="text-xs text-muted">{COHORT_BLURB[cohort]}</p>
       {scouts ? (
         <p className="text-xs text-accent/80">
-          Scouts mode: each handle&apos;s top-mentioned token is dropped before
-          scoring. Project accounts whose signal was their own bag disappear;
-          handles whose remaining calls are still good rise.
+          Scouts mode (default): each handle&apos;s top-mentioned token is dropped
+          before scoring. Project accounts whose signal was their own bag
+          disappear; handles whose remaining calls are still good rise. Turn it
+          off to see the raw-aggregate leaderboard.
         </p>
-      ) : null}
+      ) : (
+        <p className="text-xs text-amber-300/80">
+          All-calls view: every matured call counts, including project accounts
+          shilling their own token. Scouts mode (default) drops each handle&apos;s
+          #1 token.
+        </p>
+      )}
 
       {error ? (
         <div className="rounded-lg border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-300">
@@ -165,6 +175,7 @@ export default async function LeaderboardPage({ searchParams }: { searchParams: 
             rows={rows}
             cohort={cohort}
             bestCalls={bestCalls}
+            scouts={scouts}
           />
           {curves && curves.accounts.length > 0 ? (
             <LeaderboardCurvesChart data={curves} />
@@ -200,7 +211,7 @@ function EmptyState({ cohort, scouts }: { cohort: Cohort; scouts: boolean }) {
           Earliest seed mention is from Feb 2026 — first 365d closes land around
           Feb 2027. Switch to{" "}
           <Link
-            href={`/?cohort=30d&sort=excess${scouts ? "&scouts=1" : ""}`}
+            href={`/?cohort=30d&sort=excess${scouts ? "" : "&scouts=0"}`}
             className="text-accent"
           >
             30d
@@ -211,7 +222,7 @@ function EmptyState({ cohort, scouts }: { cohort: Cohort; scouts: boolean }) {
         <p className="mt-2">
           Try{" "}
           <Link
-            href={`/?cohort=30d&sort=excess${scouts ? "&scouts=1" : ""}`}
+            href={`/?cohort=30d&sort=excess${scouts ? "" : "&scouts=0"}`}
             className="text-accent"
           >
             30d
@@ -223,12 +234,12 @@ function EmptyState({ cohort, scouts }: { cohort: Cohort; scouts: boolean }) {
         <p className="mt-2">
           Or turn{" "}
           <Link
-            href={`/?cohort=${cohort}&sort=excess`}
+            href={`/?cohort=${cohort}&sort=excess&scouts=0`}
             className="text-accent"
           >
             scouts mode off
           </Link>{" "}
-          to see the full leaderboard.
+          to see the full leaderboard (incl. self-shillers).
         </p>
       ) : null}
     </div>
@@ -275,7 +286,7 @@ function Table({
                 <td className="px-3 py-2 text-right tabular-nums text-muted">{i + 1}</td>
                 <td className="px-3 py-2">
                   <Link
-                    href={`/account/${r.handle}?cohort=${cohort}${scouts ? "&scouts=1" : ""}`}
+                    href={`/account/${r.handle}?cohort=${cohort}${scouts ? "" : "&scouts=0"}`}
                     className="text-accent hover:underline"
                   >
                     @{r.handle}

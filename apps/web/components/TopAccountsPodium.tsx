@@ -7,6 +7,7 @@ type Props = {
   // One per top-3 row, same order. Null when the handle has no matured calls
   // in the cohort (rare — they'd not be on the leaderboard at all in that case).
   bestCalls: (BestCall | null)[];
+  scouts: boolean;
 };
 
 function fmtPct(v: number | null | undefined, digits = 1): string {
@@ -56,9 +57,10 @@ const PODIUM: {
   },
 ];
 
-export function TopAccountsPodium({ rows, cohort, bestCalls }: Props) {
+export function TopAccountsPodium({ rows, cohort, bestCalls, scouts }: Props) {
   const top = rows.slice(0, 3);
   if (top.length === 0) return null;
+  const scoutsQS = scouts ? "" : "&scouts=0";
 
   return (
     <section className="space-y-2">
@@ -90,7 +92,7 @@ export function TopAccountsPodium({ rows, cohort, bestCalls }: Props) {
 
               <div className="mt-1 flex items-baseline justify-between gap-2">
                 <Link
-                  href={`/account/${r.handle}?cohort=${cohort}`}
+                  href={`/account/${r.handle}?cohort=${cohort}${scoutsQS}`}
                   className="truncate text-base font-semibold text-ink hover:text-accent hover:underline"
                   title={r.display_name ?? r.handle}
                 >
@@ -165,7 +167,7 @@ export function TopAccountsPodium({ rows, cohort, bestCalls }: Props) {
                   <span aria-hidden>↗</span>
                 </a>
                 <Link
-                  href={`/account/${r.handle}?cohort=${cohort}`}
+                  href={`/account/${r.handle}?cohort=${cohort}${scoutsQS}`}
                   className="text-[11px] text-muted hover:text-ink hover:underline"
                 >
                   view calls →

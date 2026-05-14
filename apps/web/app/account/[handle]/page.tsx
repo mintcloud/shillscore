@@ -17,8 +17,10 @@ const COHORTS: Cohort[] = ["30d", "90d", "365d"];
 function parseCohort(v: string | undefined): Cohort {
   return v === "90d" || v === "365d" ? v : "30d";
 }
+// Default: scouts mode ON, matching the home leaderboard. Pass ?scouts=0 to see
+// the unfiltered view (includes the handle's #1 token, i.e. self-shills).
 function parseScouts(v: string | undefined): boolean {
-  return v === "1" || v === "true";
+  return v !== "0" && v !== "false";
 }
 
 type Params = Promise<{ handle: string }>;
@@ -40,7 +42,7 @@ export default async function AccountPage({
   let curvesData: Awaited<ReturnType<typeof getAccountMentionCurves>> | null = null;
   try {
     [data, curvesData] = await Promise.all([
-      getAccount(handle),
+      getAccount(handle, scouts),
       // 365d has no matured calls yet — skip the curves fetch.
       cohort === "365d"
         ? Promise.resolve(null)
@@ -57,7 +59,7 @@ export default async function AccountPage({
     <main className="mx-auto max-w-6xl px-6 py-10 space-y-6">
       <nav className="text-sm">
         <Link
-          href={`/?cohort=${cohort}${scouts ? "&scouts=1" : ""}`}
+          href={`/?cohort=${cohort}${scouts ? "" : "&scouts=0"}`}
           className="text-accent hover:underline"
         >
           ← leaderboard
@@ -80,7 +82,7 @@ export default async function AccountPage({
         {COHORTS.map((c) => (
           <Link
             key={c}
-            href={`/account/${account.handle}?cohort=${c}${scouts ? "&scouts=1" : ""}`}
+            href={`/account/${account.handle}?cohort=${c}${scouts ? "" : "&scouts=0"}`}
             className={`rounded-md px-3 py-1.5 border ${
               c === cohort
                 ? "border-accent bg-accent/10 text-accent"
@@ -90,7 +92,37 @@ export default async function AccountPage({
             {c}
           </Link>
         ))}
+        <span className="mx-2 text-white/10">|</span>
+        <Link
+          href={`/account/${account.handle}?cohort=${cohort}${scouts ? "&scouts=0" : ""}`}
+          title={
+            scouts
+              ? "Scouts mode on (default) — this handle's top-mentioned token per cohort is dropped before scoring. Matches the home leaderboard."
+              : "All-calls view — every matured call counts, including this handle's #1 token (self-shills, if any). Scouts mode (default) drops the dominant token to match the leaderboard."
+          }
+          className={`rounded-md px-3 py-1.5 border ${
+            scouts
+              ? "border-accent bg-accent/10 text-accent"
+              : "border-white/10 text-muted hover:text-ink hover:border-white/30"
+          }`}
+        >
+          {scouts ? "scouts: on" : "scouts: off"}
+        </Link>
       </nav>
+
+      {scouts ? (
+        <p className="text-xs text-accent/80">
+          Scouts mode (default): cohort medians below drop this handle&apos;s #1-most-mentioned
+          token per cohort. Matches what you see on the home leaderboard. Turn it
+          off to see the raw aggregate over every matured call.
+        </p>
+      ) : (
+        <p className="text-xs text-amber-300/80">
+          All-calls view: cohort medians below count every matured call, including
+          this handle&apos;s #1 token. Numbers will differ from the home leaderboard
+          (which defaults to scouts mode).
+        </p>
+      )}
 
       <section className="grid gap-3 sm:grid-cols-3">
         {COHORTS.map((c) => {

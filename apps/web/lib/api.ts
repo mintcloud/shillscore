@@ -217,8 +217,12 @@ export async function getLeaderboard(
   return fetchJson(`/leaderboard?cohort=${cohort}&sort=${sort}&limit=200${q}`);
 }
 
-export async function getAccount(handle: string): Promise<AccountResponse> {
-  return fetchJson(`/account/${encodeURIComponent(handle)}`);
+export async function getAccount(
+  handle: string,
+  excludeDominantToken = false,
+): Promise<AccountResponse> {
+  const q = excludeDominantToken ? "?exclude_dominant_token=true" : "";
+  return fetchJson(`/account/${encodeURIComponent(handle)}${q}`);
 }
 
 export async function getMention(id: number): Promise<MentionResponse> {

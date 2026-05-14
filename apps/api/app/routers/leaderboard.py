@@ -162,6 +162,7 @@ async def get_leaderboard(
 @router.get("/account/{handle}")
 async def get_account(
     handle: str,
+    exclude_dominant_token: bool = Query(False),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     handle = handle.lstrip("@").lower()
@@ -182,32 +183,91 @@ async def get_account(
 
     aid = account["id"]
 
-    cohorts = (
-        await session.execute(
-            text(
-                """
-                SELECT cohort, n_closed, n_winners, median_excess, median_raw, mean_excess
-                FROM account_leaderboard_cohort
-                WHERE account_id = :aid
-                """
-            ),
-            {"aid": aid},
-        )
-    ).mappings().all()
+    if exclude_dominant_token:
+        # Per-cohort: drop the handle's #1-most-mentioned token within that
+        # cohort, then recompute median/mean/win-rate over the remaining
+        # matured calls. Each cohort drops its own dominant token because the
+        # dominant-token set differs by cohort window.
+        cohort_summary: dict[str, dict] = {}
+        for cohort_name in ("30d", "90d", "365d"):
+            excess_col = f"r_{cohort_name}_excess"
+            raw_col = f"r_{cohort_name}"
+            closed_col = f"is_closed_{cohort_name}"
+            sql = f"""
+                WITH cohort_mentions AS (
+                  SELECT mr.token_id,
+                         mr.{raw_col} AS r_raw, mr.{excess_col} AS r_excess
+                  FROM mention_returns mr
+                  JOIN mentions m ON m.id = mr.id
+                  WHERE m.account_id = :aid
+                    AND mr.{closed_col} AND mr.{excess_col} IS NOT NULL
+                ),
+                token_counts AS (
+                  SELECT token_id, count(*) AS cnt
+                  FROM cohort_mentions
+                  GROUP BY token_id
+                ),
+                dominant_token AS (
+                  SELECT token_id FROM token_counts
+                  ORDER BY cnt DESC, token_id
+                  LIMIT 1
+                ),
+                filtered AS (
+                  SELECT cm.r_raw, cm.r_excess FROM cohort_mentions cm
+                  WHERE cm.token_id != (SELECT token_id FROM dominant_token)
+                )
+                SELECT count(*) AS n_closed,
+                       count(*) FILTER (WHERE r_excess > 0) AS n_winners,
+                       percentile_cont(0.5) WITHIN GROUP (ORDER BY r_excess) AS median_excess,
+                       percentile_cont(0.5) WITHIN GROUP (ORDER BY r_raw)    AS median_raw,
+                       avg(r_excess) AS mean_excess
+                FROM filtered
+            """
+            row = (
+                await session.execute(text(sql), {"aid": aid})
+            ).mappings().first()
+            n = int(row["n_closed"] or 0) if row else 0
+            if n == 0:
+                # Match the unfiltered behavior: omit cohorts with zero matured
+                # calls so the UI shows "no matured calls" rather than n=0.
+                continue
+            med = float(row["median_excess"]) if row["median_excess"] is not None else None
+            cohort_summary[cohort_name] = {
+                "n_matured": n,
+                "n_winners": int(row["n_winners"] or 0),
+                "win_rate": (row["n_winners"] / n) if n else None,
+                "median_excess": med,
+                "median_raw": float(row["median_raw"]) if row["median_raw"] is not None else None,
+                "mean_excess": float(row["mean_excess"]) if row["mean_excess"] is not None else None,
+                "damped_score": med * _damp(n) if med is not None else None,
+            }
+    else:
+        cohorts = (
+            await session.execute(
+                text(
+                    """
+                    SELECT cohort, n_closed, n_winners, median_excess, median_raw, mean_excess
+                    FROM account_leaderboard_cohort
+                    WHERE account_id = :aid
+                    """
+                ),
+                {"aid": aid},
+            )
+        ).mappings().all()
 
-    cohort_summary = {}
-    for c in cohorts:
-        n = int(c["n_closed"] or 0)
-        med = float(c["median_excess"]) if c["median_excess"] is not None else None
-        cohort_summary[c["cohort"]] = {
-            "n_matured": n,
-            "n_winners": int(c["n_winners"] or 0),
-            "win_rate": (c["n_winners"] / n) if n else None,
-            "median_excess": med,
-            "median_raw": float(c["median_raw"]) if c["median_raw"] is not None else None,
-            "mean_excess": float(c["mean_excess"]) if c["mean_excess"] is not None else None,
-            "damped_score": med * _damp(n) if med is not None else None,
-        }
+        cohort_summary = {}
+        for c in cohorts:
+            n = int(c["n_closed"] or 0)
+            med = float(c["median_excess"]) if c["median_excess"] is not None else None
+            cohort_summary[c["cohort"]] = {
+                "n_matured": n,
+                "n_winners": int(c["n_winners"] or 0),
+                "win_rate": (c["n_winners"] / n) if n else None,
+                "median_excess": med,
+                "median_raw": float(c["median_raw"]) if c["median_raw"] is not None else None,
+                "mean_excess": float(c["mean_excess"]) if c["mean_excess"] is not None else None,
+                "damped_score": med * _damp(n) if med is not None else None,
+            }
 
     mentions = (
         await session.execute(
