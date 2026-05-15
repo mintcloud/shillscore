@@ -25,111 +25,127 @@ router = APIRouter(tags=["leaderboard"])
 
 Cohort = Literal["30d", "90d", "365d"]
 Sort = Literal["excess", "raw"]
+View = Literal["scouts", "insiders", "all"]
 DAMP_K = 5  # sqrt(N / (N + k)) damping constant
 MIN_N = DAMP_K  # min matured calls to appear on leaderboard — matches DAMP_K so
                 # the data weight in damping is at least equal to the prior
+
+# Path A — concentration split. A handle is an "insider" when at least this
+# share of its matured calls in the cohort land on a single token, i.e. the
+# score leans on one bag; below it the handle is a "scout" (diversified).
+# 0.5 is a clean cut: with <50% on the top token a handle has necessarily
+# called >=3 distinct tokens. Empirically (30d cohort) it isolates project
+# accounts shilling their own coin — superform/UP, MANTRA, zksync, injective,
+# worldlibertyfi — into insiders, and leaves analytics/scout accounts —
+# lookonchain, nansen, arkham, AerodromeFi — as scouts. Unlike Path B's
+# drop-the-#1-token hack, scores here are the honest full-record aggregate;
+# the views only partition the population.
+CONCENTRATION_THRESHOLD = 0.5
 
 
 def _damp(n: int) -> float:
     return math.sqrt(n / (n + DAMP_K))
 
 
-def excluded_dominant_cte(cohort: Cohort) -> str:
-    """SQL CTE chain that aggregates per-handle stats after dropping each
-    handle's #1-most-mentioned token. Exposes a final CTE named `agg` with
-    columns matching account_leaderboard_cohort (sans `cohort`).
+def concentration_cte(cohort: Cohort) -> str:
+    """CTE fragment (no leading `WITH`) exposing a final CTE `concentration`
+    with per-account token-concentration stats over matured calls in `cohort`:
+    `account_id`, `n_distinct_tokens`, `top_token_id`, `top_token_share`.
+
+    Concentration is measured over exactly the population the cohort score is
+    computed from (matured calls with a non-null BTC-excess), so
+    `top_token_share` reads as "this fraction of the handle's score comes from
+    a single token".
     """
     excess_col = f"r_{cohort}_excess"
-    raw_col = f"r_{cohort}"
     closed_col = f"is_closed_{cohort}"
     return f"""
-    WITH cohort_mentions AS (
-      SELECT mr.account_id, mr.token_id,
-             mr.{raw_col} AS r_raw, mr.{excess_col} AS r_excess
-      FROM mention_returns mr
-      WHERE mr.{closed_col} AND mr.{excess_col} IS NOT NULL
+    cohort_mentions AS (
+      SELECT account_id, token_id
+      FROM mention_returns
+      WHERE {closed_col} AND {excess_col} IS NOT NULL
     ),
     token_counts AS (
       SELECT account_id, token_id, count(*) AS cnt
       FROM cohort_mentions
       GROUP BY account_id, token_id
     ),
-    dominant_token AS (
-      SELECT DISTINCT ON (account_id) account_id, token_id
+    top_token AS (
+      SELECT DISTINCT ON (account_id)
+             account_id, token_id AS top_token_id, cnt AS top_cnt
       FROM token_counts
       ORDER BY account_id, cnt DESC, token_id
     ),
-    filtered AS (
-      SELECT cm.account_id, cm.r_raw, cm.r_excess
-      FROM cohort_mentions cm
-      JOIN dominant_token dt ON dt.account_id = cm.account_id
-      WHERE cm.token_id != dt.token_id
-    ),
-    agg AS (
-      SELECT a.id AS account_id, a.handle, a.display_name, a.followers_count,
-             count(*) AS n_closed,
-             count(*) FILTER (WHERE f.r_excess > 0) AS n_winners,
-             percentile_cont(0.5) WITHIN GROUP (ORDER BY f.r_excess) AS median_excess,
-             percentile_cont(0.5) WITHIN GROUP (ORDER BY f.r_raw)    AS median_raw,
-             avg(f.r_excess)                                          AS mean_excess
-      FROM filtered f
-      JOIN accounts a ON a.id = f.account_id
-      GROUP BY a.id, a.handle, a.display_name, a.followers_count
+    concentration AS (
+      SELECT tc.account_id,
+             count(*)                              AS n_distinct_tokens,
+             tt.top_token_id,
+             tt.top_cnt::float / sum(tc.cnt)        AS top_token_share
+      FROM token_counts tc
+      JOIN top_token tt ON tt.account_id = tc.account_id
+      GROUP BY tc.account_id, tt.top_token_id, tt.top_cnt
     )
     """
+
+
+def view_filter_sql(view: View) -> str:
+    """WHERE-clause fragment partitioning the leaderboard by concentration.
+    Expects the concentration CTE aliased as `c` and a `:threshold` bind param.
+    """
+    if view == "scouts":
+        return "AND c.top_token_share < :threshold"
+    if view == "insiders":
+        return "AND c.top_token_share >= :threshold"
+    return ""
 
 
 @router.get("/leaderboard")
 async def get_leaderboard(
     cohort: Cohort = Query("30d"),
     sort: Sort = Query("excess"),
+    view: View = Query("scouts"),
     limit: int = Query(100, ge=1, le=500),
     min_n: int = Query(MIN_N, ge=1, le=500),
-    exclude_dominant_token: bool = Query(False),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
+    """Cohort leaderboard, partitioned by concentration (Path A).
+
+    `view` = scouts (default — top token < 50% of matured calls), insiders
+    (>= 50%, i.e. score leans on one bag), or all. The score is always the
+    honest full-record aggregate from `account_leaderboard_cohort`; the view
+    only filters which handles appear, and each row carries its concentration
+    stats so the bias is visible rather than hidden.
+    """
     sort_col = "median_excess" if sort == "excess" else "median_raw"
-    if exclude_dominant_token:
-        sql = f"""
-            {excluded_dominant_cte(cohort)}
-            SELECT account_id, handle, display_name, followers_count,
-                   n_closed, n_winners, median_excess, median_raw, mean_excess,
-                   NULL::double precision AS ci_low_excess,
-                   NULL::double precision AS ci_high_excess
-            FROM agg
-            WHERE n_closed >= :min_n
-            ORDER BY {sort_col} DESC NULLS LAST
-            LIMIT :limit
-        """
-        rows = (
-            await session.execute(text(sql), {"limit": limit, "min_n": min_n})
-        ).mappings().all()
-    else:
-        rows = (
-            await session.execute(
-                text(
-                    f"""
-                    SELECT lc.account_id, lc.handle, lc.display_name, lc.followers_count,
-                           lc.n_closed, lc.n_winners,
-                           lc.median_excess, lc.median_raw, lc.mean_excess,
-                           ci.ci_low_excess, ci.ci_high_excess
-                    FROM account_leaderboard_cohort lc
-                    LEFT JOIN account_ci ci ON ci.account_id = lc.account_id
-                    WHERE lc.cohort = :cohort
-                      AND lc.n_closed >= :min_n
-                    ORDER BY {sort_col} DESC NULLS LAST
-                    LIMIT :limit
-                    """
-                ),
-                {"cohort": cohort, "limit": limit, "min_n": min_n},
-            )
-        ).mappings().all()
+    sql = f"""
+        WITH {concentration_cte(cohort)}
+        SELECT lc.account_id, lc.handle, lc.display_name, lc.followers_count,
+               lc.n_closed, lc.n_winners,
+               lc.median_excess, lc.median_raw, lc.mean_excess,
+               ci.ci_low_excess, ci.ci_high_excess,
+               c.n_distinct_tokens, c.top_token_share,
+               t.symbol AS top_token_symbol
+        FROM account_leaderboard_cohort lc
+        JOIN concentration c ON c.account_id = lc.account_id
+        LEFT JOIN tokens t ON t.id = c.top_token_id
+        LEFT JOIN account_ci ci ON ci.account_id = lc.account_id
+        WHERE lc.cohort = :cohort
+          AND lc.n_closed >= :min_n
+          {view_filter_sql(view)}
+        ORDER BY {sort_col} DESC NULLS LAST
+        LIMIT :limit
+    """
+    params: dict = {"cohort": cohort, "limit": limit, "min_n": min_n}
+    if view != "all":
+        params["threshold"] = CONCENTRATION_THRESHOLD
+    rows = (await session.execute(text(sql), params)).mappings().all()
 
     out = []
     for r in rows:
         n = int(r["n_closed"] or 0)
         median = float(r[sort_col]) if r[sort_col] is not None else None
         damped = median * _damp(n) if median is not None else None
+        share = float(r["top_token_share"]) if r["top_token_share"] is not None else None
         out.append(
             {
                 "account_id": r["account_id"],
@@ -145,6 +161,10 @@ async def get_leaderboard(
                 "damped_score": damped,
                 "ci_low_excess": float(r["ci_low_excess"]) if r["ci_low_excess"] is not None else None,
                 "ci_high_excess": float(r["ci_high_excess"]) if r["ci_high_excess"] is not None else None,
+                "n_distinct_tokens": int(r["n_distinct_tokens"] or 0),
+                "top_token_symbol": r["top_token_symbol"],
+                "top_token_share": share,
+                "is_scout": share is not None and share < CONCENTRATION_THRESHOLD,
             }
         )
 
@@ -154,7 +174,8 @@ async def get_leaderboard(
     return {
         "cohort": cohort,
         "sort": sort,
-        "exclude_dominant_token": exclude_dominant_token,
+        "view": view,
+        "concentration_threshold": CONCENTRATION_THRESHOLD,
         "rows": out,
     }
 
@@ -162,9 +183,14 @@ async def get_leaderboard(
 @router.get("/account/{handle}")
 async def get_account(
     handle: str,
-    exclude_dominant_token: bool = Query(False),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
+    """Per-account stats. Cohort summaries are the honest full-record aggregate
+    (every matured call counts). Each cohort also carries a `concentration`
+    block — top token, its share, distinct-token count, and the scout/insider
+    flag — so the page can show *why* the handle is or isn't on the scouts
+    leaderboard rather than silently re-scoring it.
+    """
     handle = handle.lstrip("@").lower()
     account = (
         await session.execute(
@@ -183,91 +209,71 @@ async def get_account(
 
     aid = account["id"]
 
-    if exclude_dominant_token:
-        # Per-cohort: drop the handle's #1-most-mentioned token within that
-        # cohort, then recompute median/mean/win-rate over the remaining
-        # matured calls. Each cohort drops its own dominant token because the
-        # dominant-token set differs by cohort window.
-        cohort_summary: dict[str, dict] = {}
-        for cohort_name in ("30d", "90d", "365d"):
-            excess_col = f"r_{cohort_name}_excess"
-            raw_col = f"r_{cohort_name}"
-            closed_col = f"is_closed_{cohort_name}"
-            sql = f"""
-                WITH cohort_mentions AS (
-                  SELECT mr.token_id,
-                         mr.{raw_col} AS r_raw, mr.{excess_col} AS r_excess
-                  FROM mention_returns mr
-                  JOIN mentions m ON m.id = mr.id
-                  WHERE m.account_id = :aid
-                    AND mr.{closed_col} AND mr.{excess_col} IS NOT NULL
-                ),
-                token_counts AS (
-                  SELECT token_id, count(*) AS cnt
-                  FROM cohort_mentions
-                  GROUP BY token_id
-                ),
-                dominant_token AS (
-                  SELECT token_id FROM token_counts
-                  ORDER BY cnt DESC, token_id
-                  LIMIT 1
-                ),
-                filtered AS (
-                  SELECT cm.r_raw, cm.r_excess FROM cohort_mentions cm
-                  WHERE cm.token_id != (SELECT token_id FROM dominant_token)
-                )
-                SELECT count(*) AS n_closed,
-                       count(*) FILTER (WHERE r_excess > 0) AS n_winners,
-                       percentile_cont(0.5) WITHIN GROUP (ORDER BY r_excess) AS median_excess,
-                       percentile_cont(0.5) WITHIN GROUP (ORDER BY r_raw)    AS median_raw,
-                       avg(r_excess) AS mean_excess
-                FROM filtered
-            """
-            row = (
-                await session.execute(text(sql), {"aid": aid})
-            ).mappings().first()
-            n = int(row["n_closed"] or 0) if row else 0
-            if n == 0:
-                # Match the unfiltered behavior: omit cohorts with zero matured
-                # calls so the UI shows "no matured calls" rather than n=0.
-                continue
-            med = float(row["median_excess"]) if row["median_excess"] is not None else None
-            cohort_summary[cohort_name] = {
-                "n_matured": n,
-                "n_winners": int(row["n_winners"] or 0),
-                "win_rate": (row["n_winners"] / n) if n else None,
-                "median_excess": med,
-                "median_raw": float(row["median_raw"]) if row["median_raw"] is not None else None,
-                "mean_excess": float(row["mean_excess"]) if row["mean_excess"] is not None else None,
-                "damped_score": med * _damp(n) if med is not None else None,
-            }
-    else:
-        cohorts = (
+    cohorts = (
+        await session.execute(
+            text(
+                """
+                SELECT cohort, n_closed, n_winners, median_excess, median_raw, mean_excess
+                FROM account_leaderboard_cohort
+                WHERE account_id = :aid
+                """
+            ),
+            {"aid": aid},
+        )
+    ).mappings().all()
+
+    cohort_summary: dict[str, dict] = {}
+    for c in cohorts:
+        n = int(c["n_closed"] or 0)
+        med = float(c["median_excess"]) if c["median_excess"] is not None else None
+        cohort_summary[c["cohort"]] = {
+            "n_matured": n,
+            "n_winners": int(c["n_winners"] or 0),
+            "win_rate": (c["n_winners"] / n) if n else None,
+            "median_excess": med,
+            "median_raw": float(c["median_raw"]) if c["median_raw"] is not None else None,
+            "mean_excess": float(c["mean_excess"]) if c["mean_excess"] is not None else None,
+            "damped_score": med * _damp(n) if med is not None else None,
+        }
+
+    # Per-cohort concentration — measured over the same matured-call population
+    # the cohort score uses, so the share reads as "fraction of this handle's
+    # score that comes from one token".
+    for cohort_name, summary in cohort_summary.items():
+        excess_col = f"r_{cohort_name}_excess"
+        closed_col = f"is_closed_{cohort_name}"
+        crow = (
             await session.execute(
                 text(
-                    """
-                    SELECT cohort, n_closed, n_winners, median_excess, median_raw, mean_excess
-                    FROM account_leaderboard_cohort
-                    WHERE account_id = :aid
+                    f"""
+                    WITH cm AS (
+                      SELECT token_id FROM mention_returns
+                      WHERE account_id = :aid
+                        AND {closed_col} AND {excess_col} IS NOT NULL
+                    ),
+                    tc AS (SELECT token_id, count(*) AS cnt FROM cm GROUP BY token_id)
+                    SELECT count(*) AS n_distinct_tokens,
+                           max(cnt)::float / NULLIF(sum(cnt), 0) AS top_token_share,
+                           (SELECT t.symbol FROM tc
+                            JOIN tokens t ON t.id = tc.token_id
+                            ORDER BY tc.cnt DESC, tc.token_id LIMIT 1) AS top_token_symbol
+                    FROM tc
                     """
                 ),
                 {"aid": aid},
             )
-        ).mappings().all()
-
-        cohort_summary = {}
-        for c in cohorts:
-            n = int(c["n_closed"] or 0)
-            med = float(c["median_excess"]) if c["median_excess"] is not None else None
-            cohort_summary[c["cohort"]] = {
-                "n_matured": n,
-                "n_winners": int(c["n_winners"] or 0),
-                "win_rate": (c["n_winners"] / n) if n else None,
-                "median_excess": med,
-                "median_raw": float(c["median_raw"]) if c["median_raw"] is not None else None,
-                "mean_excess": float(c["mean_excess"]) if c["mean_excess"] is not None else None,
-                "damped_score": med * _damp(n) if med is not None else None,
-            }
+        ).mappings().first()
+        share = (
+            float(crow["top_token_share"])
+            if crow and crow["top_token_share"] is not None
+            else None
+        )
+        summary["concentration"] = {
+            "n_distinct_tokens": int(crow["n_distinct_tokens"] or 0) if crow else 0,
+            "top_token_symbol": crow["top_token_symbol"] if crow else None,
+            "top_token_share": share,
+            "is_scout": share is not None and share < CONCENTRATION_THRESHOLD,
+        }
 
     mentions = (
         await session.execute(
@@ -303,6 +309,7 @@ async def get_account(
             "lookback_days": account["lookback_days"],
             "first_seen_at": account["first_seen_at"].isoformat() if account["first_seen_at"] else None,
         },
+        "concentration_threshold": CONCENTRATION_THRESHOLD,
         "cohorts": cohort_summary,
         "mentions": [
             {

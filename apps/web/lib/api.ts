@@ -3,6 +3,9 @@ const BASE = process.env.INTERNAL_API_URL ?? "http://api:8000";
 
 export type Cohort = "30d" | "90d" | "365d";
 export type Sort = "excess" | "raw";
+// Path A — concentration split. scouts = diversified (top token < 50% of
+// matured calls); insiders = score leans on one bag (>= 50%); all = unfiltered.
+export type View = "scouts" | "insiders" | "all";
 
 export type LeaderboardRow = {
   account_id: number;
@@ -18,6 +21,20 @@ export type LeaderboardRow = {
   damped_score: number | null;
   ci_low_excess: number | null;
   ci_high_excess: number | null;
+  // Concentration — fraction of this handle's matured cohort calls on its
+  // single most-mentioned token, that token's symbol, and the distinct-token
+  // count. is_scout = top_token_share below the threshold.
+  n_distinct_tokens: number;
+  top_token_symbol: string | null;
+  top_token_share: number | null;
+  is_scout: boolean;
+};
+
+export type Concentration = {
+  n_distinct_tokens: number;
+  top_token_symbol: string | null;
+  top_token_share: number | null;
+  is_scout: boolean;
 };
 
 export type Returns = {
@@ -56,6 +73,7 @@ export type AccountResponse = {
     lookback_days: number;
     first_seen_at: string | null;
   };
+  concentration_threshold: number;
   cohorts: Record<
     string,
     {
@@ -66,6 +84,7 @@ export type AccountResponse = {
       median_raw: number | null;
       mean_excess: number | null;
       damped_score: number | null;
+      concentration: Concentration;
     }
   >;
   mentions: AccountMention[];
@@ -207,22 +226,21 @@ async function fetchJson<T>(path: string, revalidate = 60): Promise<T> {
 export async function getLeaderboard(
   cohort: Cohort,
   sort: Sort,
-  excludeDominantToken = false,
+  view: View = "scouts",
 ): Promise<{
   cohort: Cohort;
   sort: Sort;
+  view: View;
+  concentration_threshold: number;
   rows: LeaderboardRow[];
 }> {
-  const q = excludeDominantToken ? "&exclude_dominant_token=true" : "";
-  return fetchJson(`/leaderboard?cohort=${cohort}&sort=${sort}&limit=200${q}`);
+  return fetchJson(
+    `/leaderboard?cohort=${cohort}&sort=${sort}&view=${view}&limit=200`,
+  );
 }
 
-export async function getAccount(
-  handle: string,
-  excludeDominantToken = false,
-): Promise<AccountResponse> {
-  const q = excludeDominantToken ? "?exclude_dominant_token=true" : "";
-  return fetchJson(`/account/${encodeURIComponent(handle)}${q}`);
+export async function getAccount(handle: string): Promise<AccountResponse> {
+  return fetchJson(`/account/${encodeURIComponent(handle)}`);
 }
 
 export async function getMention(id: number): Promise<MentionResponse> {
@@ -236,11 +254,10 @@ export async function getMentionSeries(id: number): Promise<SeriesResponse> {
 export async function getLeaderboardCurves(
   cohort: Cohort,
   limit = 10,
-  excludeDominantToken = false,
+  view: View = "scouts",
 ): Promise<LeaderboardCurvesResponse> {
-  const q = excludeDominantToken ? "&exclude_dominant_token=true" : "";
   return fetchJson(
-    `/leaderboard/equity-curves?cohort=${cohort}&limit=${limit}${q}`,
+    `/leaderboard/equity-curves?cohort=${cohort}&limit=${limit}&view=${view}`,
   );
 }
 
@@ -248,11 +265,10 @@ export async function getTokenCharts(
   cohort: "30d" | "90d",
   limit = 9,
   accountsLimit = 10,
-  excludeDominantToken = false,
+  view: View = "scouts",
 ): Promise<TokenChartsResponse> {
-  const q = excludeDominantToken ? "&exclude_dominant_token=true" : "";
   return fetchJson(
-    `/leaderboard/token-charts?cohort=${cohort}&limit=${limit}&accounts_limit=${accountsLimit}${q}`,
+    `/leaderboard/token-charts?cohort=${cohort}&limit=${limit}&accounts_limit=${accountsLimit}&view=${view}`,
   );
 }
 
@@ -268,11 +284,9 @@ export async function getAccountMentionCurves(
 export async function getAccountBestCall(
   handle: string,
   cohort: Cohort,
-  excludeDominantToken = false,
 ): Promise<BestCallResponse> {
-  const q = excludeDominantToken ? "&exclude_dominant_token=true" : "";
   return fetchJson(
-    `/account/${encodeURIComponent(handle)}/best-call?cohort=${cohort}${q}`,
+    `/account/${encodeURIComponent(handle)}/best-call?cohort=${cohort}`,
   );
 }
 

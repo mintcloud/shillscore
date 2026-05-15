@@ -88,8 +88,8 @@ A daily cron (`06:00–06:30 UTC`) keeps benchmarks, daily price series, and bot
 
 | Route | What it shows |
 |---|---|
-| `/` | Top-3 podium (Follow-on-X CTAs), equity-curve chart, token-charts grid ("who caught the winners"), full leaderboard table. Cohort + sort + scouts toggles drive everything. **Scouts mode is the default** — each handle's #1-most-mentioned token is dropped before scoring, exposing the diversified callers and burying project-account self-shillers. `?scouts=0` opts out into the raw all-calls view. |
-| `/account/[handle]` | Per-account stats per cohort (scouts-aware — toggle on the page or via `?scouts=0` to see the unfiltered view; cohort cards match the home leaderboard when scouts is on), mention-curves chart, full mention list. |
+| `/` | Top-3 podium (Follow-on-X CTAs), equity-curve chart, token-charts grid ("who caught the winners"), full leaderboard table. Cohort + sort + **view** drive everything. The view is a three-way concentration split (Path A): **Scouts** (default) — handles whose single most-mentioned token is under 50% of their matured calls, i.e. diversified callers; **Insiders** — handles ≥50% concentrated on one token, overwhelmingly project accounts ranked on their own coin; **All** — unfiltered. Scores are always the honest full-record aggregate — the view only partitions handles, it does not re-score them. `?view=insiders` / `?view=all` switch tabs. |
+| `/account/[handle]` | Per-account stats per cohort — honest full-record aggregate, with a Scout/Insider badge and per-cohort concentration (distinct-token count + top-token share). Mention-curves chart, full mention list. |
 | `/mention/[id]` | Tweet + price chart + open/closed status across cohorts. |
 
 API endpoints powering the UI: `/api/leaderboard`, `/api/leaderboard/equity-curves`, `/api/leaderboard/token-charts`, `/api/account/{handle}`, `/api/account/{handle}/mention-curves`, `/api/mention/{id}`, `/api/mention/{id}/series`.

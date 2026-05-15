@@ -2,6 +2,8 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
   type Cohort,
+  type Concentration,
+  type View,
   fmtDate,
   getAccount,
   getAccountMentionCurves,
@@ -17,14 +19,17 @@ const COHORTS: Cohort[] = ["30d", "90d", "365d"];
 function parseCohort(v: string | undefined): Cohort {
   return v === "90d" || v === "365d" ? v : "30d";
 }
-// Default: scouts mode ON, matching the home leaderboard. Pass ?scouts=0 to see
-// the unfiltered view (includes the handle's #1 token, i.e. self-shills).
-function parseScouts(v: string | undefined): boolean {
-  return v !== "0" && v !== "false";
+// `view` is read only to preserve the leaderboard tab on back-navigation —
+// the account page itself always shows the honest full-record numbers.
+function parseView(v: string | undefined): View {
+  return v === "insiders" || v === "all" ? v : "scouts";
+}
+function viewQS(view: View): string {
+  return view === "scouts" ? "" : `&view=${view}`;
 }
 
 type Params = Promise<{ handle: string }>;
-type SP = Promise<{ cohort?: string; scouts?: string }>;
+type SP = Promise<{ cohort?: string; view?: string }>;
 
 export default async function AccountPage({
   params,
@@ -36,13 +41,14 @@ export default async function AccountPage({
   const { handle } = await params;
   const sp = await searchParams;
   const cohort = parseCohort(sp.cohort);
-  const scouts = parseScouts(sp.scouts);
+  const view = parseView(sp.view);
+  const vqs = viewQS(view);
 
   let data;
   let curvesData: Awaited<ReturnType<typeof getAccountMentionCurves>> | null = null;
   try {
     [data, curvesData] = await Promise.all([
-      getAccount(handle, scouts),
+      getAccount(handle),
       // 365d has no matured calls yet — skip the curves fetch.
       cohort === "365d"
         ? Promise.resolve(null)
@@ -54,20 +60,26 @@ export default async function AccountPage({
   }
 
   const { account, cohorts, mentions } = data;
+  const activeConc = cohorts[cohort]?.concentration ?? null;
 
   return (
     <main className="mx-auto max-w-6xl px-6 py-10 space-y-6">
       <nav className="text-sm">
         <Link
-          href={`/?cohort=${cohort}${scouts ? "" : "&scouts=0"}`}
+          href={`/?cohort=${cohort}${vqs}`}
           className="text-accent hover:underline"
         >
           ← leaderboard
         </Link>
       </nav>
 
-      <header className="space-y-1">
-        <h1 className="text-3xl font-semibold tracking-tight">@{account.handle}</h1>
+      <header className="space-y-2">
+        <div className="flex flex-wrap items-center gap-3">
+          <h1 className="text-3xl font-semibold tracking-tight">
+            @{account.handle}
+          </h1>
+          {activeConc ? <ClassBadge conc={activeConc} cohort={cohort} /> : null}
+        </div>
         {account.display_name ? (
           <p className="text-muted">{account.display_name}</p>
         ) : null}
@@ -82,7 +94,7 @@ export default async function AccountPage({
         {COHORTS.map((c) => (
           <Link
             key={c}
-            href={`/account/${account.handle}?cohort=${c}${scouts ? "" : "&scouts=0"}`}
+            href={`/account/${account.handle}?cohort=${c}${vqs}`}
             className={`rounded-md px-3 py-1.5 border ${
               c === cohort
                 ? "border-accent bg-accent/10 text-accent"
@@ -92,37 +104,14 @@ export default async function AccountPage({
             {c}
           </Link>
         ))}
-        <span className="mx-2 text-white/10">|</span>
-        <Link
-          href={`/account/${account.handle}?cohort=${cohort}${scouts ? "&scouts=0" : ""}`}
-          title={
-            scouts
-              ? "Scouts mode on (default) — this handle's top-mentioned token per cohort is dropped before scoring. Matches the home leaderboard."
-              : "All-calls view — every matured call counts, including this handle's #1 token (self-shills, if any). Scouts mode (default) drops the dominant token to match the leaderboard."
-          }
-          className={`rounded-md px-3 py-1.5 border ${
-            scouts
-              ? "border-accent bg-accent/10 text-accent"
-              : "border-white/10 text-muted hover:text-ink hover:border-white/30"
-          }`}
-        >
-          {scouts ? "scouts: on" : "scouts: off"}
-        </Link>
       </nav>
 
-      {scouts ? (
-        <p className="text-xs text-accent/80">
-          Scouts mode (default): cohort medians below drop this handle&apos;s #1-most-mentioned
-          token per cohort. Matches what you see on the home leaderboard. Turn it
-          off to see the raw aggregate over every matured call.
-        </p>
-      ) : (
-        <p className="text-xs text-amber-300/80">
-          All-calls view: cohort medians below count every matured call, including
-          this handle&apos;s #1 token. Numbers will differ from the home leaderboard
-          (which defaults to scouts mode).
-        </p>
-      )}
+      <p className="text-xs text-muted">
+        Cohort medians below are the honest full-record aggregate over every
+        matured call. The Scout / Insider tag is set by concentration — what
+        share of those calls land on the handle&apos;s single most-mentioned
+        token — and decides which leaderboard tab the handle appears in.
+      </p>
 
       <section className="grid gap-3 sm:grid-cols-3">
         {COHORTS.map((c) => {
@@ -154,6 +143,7 @@ export default async function AccountPage({
                   <div className="text-xs text-muted">
                     damped {pct(s.damped_score)}
                   </div>
+                  <ConcentrationLine conc={s.concentration} />
                 </>
               ) : (
                 <div className="text-sm text-muted">no matured calls</div>
@@ -241,5 +231,53 @@ export default async function AccountPage({
         )}
       </section>
     </main>
+  );
+}
+
+// Header pill: scout vs insider for the active cohort.
+function ClassBadge({ conc, cohort }: { conc: Concentration; cohort: Cohort }) {
+  const sharePct =
+    conc.top_token_share !== null
+      ? `${Math.round(conc.top_token_share * 100)}%`
+      : "—";
+  const scout = conc.is_scout;
+  return (
+    <span
+      title={
+        scout
+          ? `Scout — most-mentioned token (${conc.top_token_symbol ?? "—"}) is only ${sharePct} of ${cohort} matured calls across ${conc.n_distinct_tokens} distinct tokens.`
+          : `Insider — ${sharePct} of ${cohort} matured calls are on a single token (${conc.top_token_symbol ?? "—"}). Score leans on one bag.`
+      }
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold uppercase tracking-wider ${
+        scout
+          ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
+          : "border-amber-400/40 bg-amber-400/10 text-amber-300"
+      }`}
+    >
+      {scout ? "Scout" : "Insider"}
+      {conc.top_token_symbol ? (
+        <span className="font-normal normal-case opacity-80">
+          {conc.top_token_symbol} {sharePct}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+// Per-cohort-card line: concentration breakdown.
+function ConcentrationLine({ conc }: { conc: Concentration }) {
+  if (!conc.top_token_symbol) return null;
+  const sharePct =
+    conc.top_token_share !== null
+      ? `${Math.round(conc.top_token_share * 100)}%`
+      : "—";
+  return (
+    <div className="text-xs text-muted">
+      {conc.n_distinct_tokens} token{conc.n_distinct_tokens === 1 ? "" : "s"} ·
+      top{" "}
+      <span className={conc.is_scout ? "text-ink" : "text-amber-300/90"}>
+        {conc.top_token_symbol} {sharePct}
+      </span>
+    </div>
   );
 }
