@@ -120,8 +120,22 @@ export type SeriesResponse = {
 export type EquityCurvePoint = {
   ts: string;
   n: number;
+  // Running mean BTC-excess after this call (`cum_mean`) and just before it
+  // (`mean_before`) — cum_mean is the y-value the line is drawn at; the gap
+  // between the two is how much this single call nudged the line.
   cum_mean: number;
+  mean_before: number;
+  // What this one call yielded vs BTC over the cohort horizon.
   last_excess: number;
+  // The mention behind the dot — powers the click-to-inspect card: token
+  // symbol, the tweet itself, and the cached X embed (`oembed_html`).
+  // `oembed_error` non-null = X says the tweet can't embed → plain-text card.
+  mention_id: number;
+  symbol: string | null;
+  tweet_id: string;
+  tweet_text: string;
+  oembed_html: string | null;
+  oembed_error: string | null;
 };
 
 export type LeaderboardCurvesResponse = {

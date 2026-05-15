@@ -70,14 +70,29 @@ async def _running_mean_curve(
 ) -> list[dict]:
     """Calendar-time series of running-mean excess return for one account.
 
+    One point per matured call, ordered by tweet time — i.e. every dot on
+    the equity curve *is* a mention. Each point carries the mention behind
+    it (token symbol, tweet text, cached oEmbed HTML for a real X card) plus
+    `last_excess` (what that single call yielded vs BTC) and the running
+    mean immediately before/after it. The frontend uses those to render,
+    per dot: the tweet, the token, and how much that call moved the line.
+
     Always over the honest full record — Path A partitions accounts into
     views, it does not drop tokens from the curve.
     """
     excess_col = _EXCESS_COL[cohort]
     closed_col = _CLOSED_COL[cohort]
+    # JOIN mentions for tweet/token detail and LEFT JOIN raw_tweets for the
+    # cached oEmbed HTML — same hover-card payload the token-charts dots ship.
     sql = f"""
-        SELECT mr.tweet_ts, mr.{excess_col} AS x
+        SELECT mr.tweet_ts, mr.{excess_col} AS x,
+               m.id AS mention_id, m.tweet_id, m.tweet_text,
+               t.symbol AS token_symbol,
+               rt.oembed_html, rt.oembed_error
         FROM mention_returns mr
+        JOIN mentions m ON m.id = mr.id
+        LEFT JOIN tokens t ON t.id = m.token_id
+        LEFT JOIN raw_tweets rt ON rt.tweet_id = m.tweet_id
         WHERE mr.account_id = :aid
           AND mr.{closed_col}
           AND mr.{excess_col} IS NOT NULL
@@ -90,13 +105,23 @@ async def _running_mean_curve(
     pts: list[dict] = []
     total = 0.0
     for i, r in enumerate(rows, start=1):
+        # Running mean as the line stood *before* this call lands — 0 for the
+        # first call. cum_mean is the value *after*; the gap is the call's nudge.
+        mean_before = total / (i - 1) if i > 1 else 0.0
         total += float(r["x"])
         pts.append(
             {
                 "ts": r["tweet_ts"].isoformat(),
                 "n": i,
                 "cum_mean": total / i,
+                "mean_before": mean_before,
                 "last_excess": float(r["x"]),
+                "mention_id": r["mention_id"],
+                "symbol": r["token_symbol"],
+                "tweet_id": r["tweet_id"],
+                "tweet_text": r["tweet_text"],
+                "oembed_html": r["oembed_html"],
+                "oembed_error": r["oembed_error"],
             }
         )
     return pts

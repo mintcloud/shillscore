@@ -12,8 +12,10 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import type { LeaderboardCurvesResponse } from "@/lib/api";
+import type { EquityCurvePoint, LeaderboardCurvesResponse } from "@/lib/api";
 import { CHART_PALETTE } from "@/lib/palette";
+import { TweetEmbedCard } from "@/components/TweetEmbedCard";
+import { loadTwitterWidgets } from "@/lib/twitter-widgets";
 
 type Props = {
   data: LeaderboardCurvesResponse;
@@ -26,6 +28,13 @@ function fmtPct(v: number | null | undefined, digits = 1) {
   const s = (v * 100).toFixed(digits);
   const n = Number(s);
   return `${n > 0 ? "+" : ""}${s}%`;
+}
+
+function pctClass(v: number | null | undefined) {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "text-muted";
+  if (v > 0) return "text-emerald-400";
+  if (v < 0) return "text-rose-400";
+  return "text-muted";
 }
 
 function fmtDate(t: number) {
@@ -64,20 +73,37 @@ function buildYTicks(yMin: number, yMax: number): {
   return { ticks, domain: [lo, hi] };
 }
 
+// Which dot the user has clicked open. Keyed by handle + the point's epoch ts.
+type SelectedDot = { handle: string; ts: number };
+
 export function LeaderboardCurvesChart({ data }: Props) {
   const [pinned, setPinned] = useState<string | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
+  const [selected, setSelected] = useState<SelectedDot | null>(null);
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
+  // Preload widgets.js once mounted so the first dot-click doesn't pay the
+  // ~30KB script latency before the X card renders. Fire-and-forget.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const idle = (window as Window & {
+      requestIdleCallback?: (cb: () => void) => number;
+    }).requestIdleCallback;
+    const fire = () => loadTwitterWidgets().catch(() => undefined);
+    if (idle) idle(fire);
+    else setTimeout(fire, 500);
+  }, []);
+
   const accounts = data.accounts;
 
-  const { rows, lines, yTicks, yDomain, xDomain, xTicks } = useMemo(() => {
+  const { rows, lines, pointIndex, yTicks, yDomain, xDomain, xTicks } = useMemo(() => {
     if (accounts.length === 0) {
       const now = Date.now();
       return {
         rows: [],
         lines: [] as { handle: string; color: string; final: number; n: number; median: number | null; damped: number }[],
+        pointIndex: new Map<string, Map<number, EquityCurvePoint>>(),
         yTicks: [-0.05, 0, 0.05],
         yDomain: [-0.05, 0.05] as [number, number],
         xDomain: [now - 86_400_000, now] as [number, number],
@@ -87,14 +113,22 @@ export function LeaderboardCurvesChart({ data }: Props) {
     const today = Date.now();
     // Build a per-account map: ts -> cum_mean at each real event, plus a
     // synthetic "today" anchor at the account's last value so the curve
-    // visibly extends to today.
+    // visibly extends to today. `pointIndex` keeps the full mention payload
+    // per (handle, ts) so a clicked dot can look up its tweet + token.
     const eventsByHandle = new Map<string, Map<number, number>>();
+    const pointIndex = new Map<string, Map<number, EquityCurvePoint>>();
     for (const a of accounts) {
       const m = new Map<number, number>();
-      for (const p of a.curve) m.set(new Date(p.ts).getTime(), p.cum_mean);
+      const pm = new Map<number, EquityCurvePoint>();
+      for (const p of a.curve) {
+        const t = new Date(p.ts).getTime();
+        m.set(t, p.cum_mean);
+        pm.set(t, p);
+      }
       const last = a.curve[a.curve.length - 1]?.cum_mean;
       if (last !== undefined && !m.has(today)) m.set(today, last);
       eventsByHandle.set(a.handle, m);
+      pointIndex.set(a.handle, pm);
     }
 
     // Union of all timestamps where ANY account has a real or synthetic point.
@@ -156,8 +190,31 @@ export function LeaderboardCurvesChart({ data }: Props) {
       };
     });
 
-    return { rows, lines, yTicks, yDomain, xDomain: [xMin, xMax] as [number, number], xTicks };
+    return {
+      rows,
+      lines,
+      pointIndex,
+      yTicks,
+      yDomain,
+      xDomain: [xMin, xMax] as [number, number],
+      xTicks,
+    };
   }, [accounts]);
+
+  // The mention payload behind the currently-selected dot.
+  const selectedDetail = useMemo(() => {
+    if (!selected) return null;
+    const point = pointIndex.get(selected.handle)?.get(selected.ts);
+    if (!point) return null;
+    const acc = accounts.find((a) => a.handle === selected.handle);
+    const line = lines.find((l) => l.handle === selected.handle);
+    return {
+      handle: selected.handle,
+      color: line?.color ?? "#9aa0a6",
+      total: acc?.curve.length ?? point.n,
+      point,
+    };
+  }, [selected, pointIndex, accounts, lines]);
 
   if (accounts.length === 0) {
     return (
@@ -169,6 +226,27 @@ export function LeaderboardCurvesChart({ data }: Props) {
 
   const activeHandle = pinned ?? hovered;
 
+  // Clicking a dot opens (or toggles shut) its mention card and isolates
+  // that account's line so the dot is easy to find again.
+  function pickDot(handle: string, ts: number) {
+    setSelected((cur) =>
+      cur && cur.handle === handle && cur.ts === ts
+        ? null
+        : { handle, ts },
+    );
+    setPinned(handle);
+  }
+
+  // Render z-order: draw the active line last so its (clickable) dots sit on
+  // top of the others when curves overlap.
+  const orderedLines = activeHandle
+    ? [...lines].sort(
+        (a, b) =>
+          (a.handle === activeHandle ? 1 : 0) -
+          (b.handle === activeHandle ? 1 : 0),
+      )
+    : lines;
+
   return (
     <div className="space-y-3">
       <div className="flex items-baseline justify-between gap-2">
@@ -176,7 +254,8 @@ export function LeaderboardCurvesChart({ data }: Props) {
           how the leaderboard is built
         </h2>
         <p className="text-xs text-muted">
-          running mean BTC-excess per account · x = calendar time · curve ends today
+          running mean BTC-excess per account · each dot = one matured call ·
+          curve ends today
         </p>
       </div>
       <div className="relative rounded-lg border border-white/10 bg-surface p-3">
@@ -186,7 +265,10 @@ export function LeaderboardCurvesChart({ data }: Props) {
             <LineChart
               data={rows}
               margin={{ top: 12, right: 24, left: 4, bottom: 8 }}
-              onClick={() => setPinned(null)}
+              onClick={() => {
+                setPinned(null);
+                setSelected(null);
+              }}
             >
               <CartesianGrid stroke="rgba(255,255,255,0.06)" strokeDasharray="3 3" />
               <XAxis
@@ -228,11 +310,12 @@ export function LeaderboardCurvesChart({ data }: Props) {
                 wrapperStyle={{ outline: "none" }}
                 isAnimationActive={false}
               />
-              {lines.map((l) => {
+              {orderedLines.map((l) => {
                 const isActive = activeHandle === l.handle;
                 const anyActive = activeHandle !== null;
                 const opacity = !anyActive ? 0.95 : isActive ? 1 : 0.15;
                 const width = isActive ? 2.6 : 1.6;
+                const pointsForLine = pointIndex.get(l.handle);
                 return (
                   <Line
                     key={l.handle}
@@ -241,16 +324,21 @@ export function LeaderboardCurvesChart({ data }: Props) {
                     stroke={l.color}
                     strokeWidth={width}
                     strokeOpacity={opacity}
-                    // Visible dots at every real data point so each line is
-                    // anchored — without these the bare curves are impossible
-                    // to attribute to an account.
-                    dot={{
-                      r: isActive ? 3.5 : 2.5,
-                      fill: l.color,
-                      stroke: "rgba(0,0,0,0.6)",
-                      strokeWidth: 0.5,
-                      fillOpacity: opacity,
-                    }}
+                    // Each dot is a matured call. Custom renderer makes the
+                    // real-mention dots clickable (with an oversized invisible
+                    // hit target since the visible dots are tiny) — clicking
+                    // opens that call's tweet + score-impact card below.
+                    dot={(dotProps) =>
+                      renderCurveDot(dotProps, {
+                        color: l.color,
+                        opacity,
+                        isActive,
+                        points: pointsForLine,
+                        selectedTs:
+                          selected?.handle === l.handle ? selected.ts : null,
+                        onPick: (ts) => pickDot(l.handle, ts),
+                      })
+                    }
                     activeDot={{
                       r: 5,
                       fill: l.color,
@@ -272,6 +360,24 @@ export function LeaderboardCurvesChart({ data }: Props) {
           </div>
         ) : null}
       </div>
+
+      {/* Selected-call card — the mention behind the clicked dot. */}
+      {selectedDetail ? (
+        <SelectedCallCard
+          handle={selectedDetail.handle}
+          color={selectedDetail.color}
+          total={selectedDetail.total}
+          point={selectedDetail.point}
+          cohort={data.cohort}
+          onClose={() => setSelected(null)}
+        />
+      ) : (
+        <p className="rounded-lg border border-dashed border-white/10 bg-surface/50 px-3 py-2 text-[11px] text-muted">
+          Every dot is one matured call. <span className="text-ink">Click a dot</span> to
+          see the tweet, the token it called, and how much that call moved the
+          account&apos;s line.
+        </p>
+      )}
 
       {/* Legend / score-comparison strip */}
       <div className="overflow-x-auto rounded-lg border border-white/10 bg-surface">
@@ -364,10 +470,231 @@ export function LeaderboardCurvesChart({ data }: Props) {
       </div>
       <p className="text-[10px] text-muted">
         Why three numbers? The chart plots the running <span className="text-ink">raw mean</span>{" "}
-        — easy to read off as a curve but volatile. The leaderboard sorts by{" "}
+        — easy to read off as a curve but volatile. Each dot is one matured call; click
+        it to see the tweet and how much it nudged the mean. The leaderboard sorts by{" "}
         <span className="text-ink">dampened</span> = median × √(N / (N + 5)), which trims tails and
         penalizes thin samples. Hover or click a row to isolate that account.
       </p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Custom dot renderer for the equity curves.
+//
+// Recharts hands this every point of a line (see component/Dots.js): real
+// mention points get a clickable dot with an oversized transparent hit
+// circle (the visible dot is only ~2.5px); the synthetic "today" anchor and
+// null gaps get a plain dot / nothing. `points` is the per-handle index keyed
+// on epoch ts — a hit there = a real mention, a miss = the today anchor.
+// ---------------------------------------------------------------------------
+type CurveDotInput = {
+  cx?: number;
+  cy?: number;
+  value?: number | null;
+  payload?: { ts?: number } | null;
+};
+
+function renderCurveDot(
+  props: CurveDotInput,
+  opts: {
+    color: string;
+    opacity: number;
+    isActive: boolean;
+    points: Map<number, EquityCurvePoint> | undefined;
+    selectedTs: number | null;
+    onPick: (ts: number) => void;
+  },
+) {
+  const { cx, cy, payload } = props;
+  if (
+    typeof cx !== "number" ||
+    typeof cy !== "number" ||
+    !payload ||
+    typeof payload.ts !== "number"
+  ) {
+    return <g />;
+  }
+  const ts = payload.ts;
+  const mention = opts.points?.get(ts);
+  // No mention behind it (the "today" anchor) → plain, non-interactive dot.
+  if (!mention) {
+    return (
+      <circle
+        cx={cx}
+        cy={cy}
+        r={opts.isActive ? 3 : 2.2}
+        fill={opts.color}
+        fillOpacity={opts.opacity}
+        stroke="rgba(0,0,0,0.6)"
+        strokeWidth={0.5}
+      />
+    );
+  }
+  const isSelected = opts.selectedTs === ts;
+  const r = isSelected ? 5.5 : opts.isActive ? 3.5 : 2.6;
+  return (
+    <g
+      style={{ cursor: "pointer" }}
+      onClick={(e) => {
+        e.stopPropagation();
+        opts.onPick(ts);
+      }}
+    >
+      {/* Oversized invisible hit target — the visible dots are tiny. */}
+      <circle cx={cx} cy={cy} r={9} fill="transparent" />
+      <circle
+        cx={cx}
+        cy={cy}
+        r={r}
+        fill={opts.color}
+        fillOpacity={opts.opacity}
+        stroke={isSelected ? "#ffffff" : "rgba(0,0,0,0.6)"}
+        strokeWidth={isSelected ? 1.6 : 0.5}
+      />
+    </g>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Selected-call card — renders the mention behind a clicked dot: the tweet
+// itself, the token it called, and how that one call moved the line.
+// ---------------------------------------------------------------------------
+function StatRow({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 border-b border-white/[0.06] pb-1.5">
+      <span className="text-[10px] uppercase tracking-wider text-muted">
+        {label}
+      </span>
+      <span className="text-right">{children}</span>
+    </div>
+  );
+}
+
+function SelectedCallCard({
+  handle,
+  color,
+  total,
+  point,
+  cohort,
+  onClose,
+}: {
+  handle: string;
+  color: string;
+  total: number;
+  point: EquityCurvePoint;
+  cohort: string;
+  onClose: () => void;
+}) {
+  const nudge = point.cum_mean - point.mean_before;
+  const tokenLabel = point.symbol
+    ? `$${point.symbol.toUpperCase()}`
+    : "unknown token";
+  return (
+    <div className="rounded-lg border border-white/10 bg-surface p-3">
+      <div className="mb-2 flex items-baseline justify-between gap-2">
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <span className="inline-flex items-center gap-1.5 text-sm">
+            <span
+              className="inline-block h-2.5 w-2.5 rounded-full"
+              style={{ background: color }}
+            />
+            <Link
+              href={`/account/${handle}`}
+              className="font-medium text-ink hover:text-accent hover:underline"
+            >
+              @{handle}
+            </Link>
+          </span>
+          <span className="text-xs text-muted">
+            call {point.n} of {total} ·{" "}
+            {fmtDate(new Date(point.ts).getTime())}
+          </span>
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="shrink-0 rounded border border-white/10 px-1.5 py-0.5 text-[10px] text-muted hover:bg-white/5 hover:text-ink"
+        >
+          close ✕
+        </button>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-[minmax(0,360px)_1fr]">
+        {/* The rendered mention */}
+        <div className="min-w-0">
+          <TweetEmbedCard
+            tweetId={point.tweet_id}
+            handle={handle}
+            oembedHtml={point.oembed_html}
+            oembedError={point.oembed_error}
+            tweetText={point.tweet_text}
+            tweetTs={point.ts}
+          />
+        </div>
+
+        {/* Token + score impact */}
+        <div className="space-y-2 text-xs">
+          <StatRow label="Token called">
+            <Link
+              href={`/mention/${point.mention_id}`}
+              className="font-medium text-ink hover:text-accent hover:underline"
+            >
+              {tokenLabel}
+            </Link>
+          </StatRow>
+          <StatRow label={`What the call yielded (${cohort})`}>
+            <span className={`font-medium tabular-nums ${pctClass(point.last_excess)}`}>
+              {fmtPct(point.last_excess)}{" "}
+              <span className="text-[10px] font-normal text-muted">
+                BTC-excess
+              </span>
+            </span>
+          </StatRow>
+          <StatRow label="Effect on the line">
+            <span className="tabular-nums text-ink">
+              {fmtPct(point.mean_before)} → {fmtPct(point.cum_mean)}{" "}
+              <span className={pctClass(nudge)}>
+                ({fmtPct(nudge, 2)})
+              </span>
+            </span>
+          </StatRow>
+          <p className="text-[10px] leading-snug text-muted">
+            {point.n === 1 ? (
+              <>
+                First matured call — it set @{handle}&apos;s running-mean
+                curve at its starting value of{" "}
+                <span className={pctClass(point.cum_mean)}>
+                  {fmtPct(point.cum_mean)}
+                </span>
+                .
+              </>
+            ) : (
+              <>
+                This call returned{" "}
+                <span className={pctClass(point.last_excess)}>
+                  {fmtPct(point.last_excess)}
+                </span>{" "}
+                vs BTC —{" "}
+                {point.last_excess >= point.mean_before ? "above" : "below"}{" "}
+                the {fmtPct(point.mean_before)} running mean at the time — so it
+                pulled the line {nudge >= 0 ? "up" : "down"} by{" "}
+                {fmtPct(Math.abs(nudge), 2)} to{" "}
+                <span className={pctClass(point.cum_mean)}>
+                  {fmtPct(point.cum_mean)}
+                </span>
+                .
+              </>
+            )}
+          </p>
+        </div>
+      </div>
     </div>
   );
 }
