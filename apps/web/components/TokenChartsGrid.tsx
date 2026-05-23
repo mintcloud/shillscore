@@ -14,8 +14,13 @@ function fmtPct(v: number | null | undefined, digits = 1): string {
   return `${n > 0 ? "+" : ""}${s}%`;
 }
 
-function fmtIndexed(v: number): string {
-  return `${(v * 100).toFixed(0)}`;
+// Y-axis ticks read as "% gain from t0" (indexed=1.0). Indexed=1.0 → "0%",
+// 1.25 → "+25%", 0.8 → "-20%". This is the question the reader is asking, so
+// the axis answers it directly instead of forcing a mental subtraction.
+function fmtPctGain(v: number): string {
+  const pct = Math.round((v - 1) * 100);
+  if (pct === 0) return "0%";
+  return `${pct > 0 ? "+" : ""}${pct}%`;
 }
 
 function fmtDate(iso: string): string {
@@ -57,6 +62,23 @@ export function TokenChartsGrid({ data }: Props) {
     [data.accounts],
   );
 
+  // Shared y-scale across every panel so a 4× token reads visually 4× a 1.3×
+  // token. Tufte: identical scales are what makes small multiples work.
+  const sharedY = useMemo(() => {
+    const allY: number[] = [];
+    for (const t of data.tokens) {
+      for (const p of t.series) allY.push(p.indexed);
+      for (const m of t.mentions) {
+        if (m.indexed !== null) allY.push(m.indexed);
+      }
+    }
+    if (allY.length === 0) return { yMin: 0.9, yMax: 1.1 };
+    const yMn = Math.min(...allY);
+    const yMx = Math.max(...allY);
+    const padY = (yMx - yMn) * 0.08 || 0.05;
+    return { yMin: Math.max(0, yMn - padY), yMax: yMx + padY };
+  }, [data.tokens]);
+
   if (data.tokens.length === 0) {
     return (
       <div className="rounded-lg border border-white/10 bg-surface p-6 text-sm text-muted">
@@ -96,6 +118,7 @@ export function TokenChartsGrid({ data }: Props) {
             handleToColor={handleToColor}
             topHandles={topHandles}
             hovered={hovered}
+            sharedY={sharedY}
           />
         ))}
       </div>
@@ -198,12 +221,14 @@ function TokenPanel({
   handleToColor,
   topHandles,
   hovered,
+  sharedY,
 }: {
   token: TokenChartsToken;
   horizon: number;
   handleToColor: Map<string, string>;
   topHandles: Set<string>;
   hovered: string | null;
+  sharedY: { yMin: number; yMax: number };
 }) {
   const colorFor = (handle: string) =>
     topHandles.has(handle)
@@ -236,7 +261,7 @@ function TokenPanel({
     indexed: number;
     mention: TokenChartsTokenMention;
   };
-  const { dayValues, byHandle, yMin, yMax, lineDays } = useMemo(() => {
+  const { dayValues, byHandle, yMin, yMax, lineDays, peakDay } = useMemo(() => {
     const dv = new Map<number, number>();
     for (const p of token.series) {
       const d = Math.round(p.day);
@@ -251,20 +276,27 @@ function TokenPanel({
       arr.push({ day: m.day, indexed: m.indexed, mention: m });
       bh.set(m.handle, arr);
     }
-    const allY: number[] = [...dv.values()];
-    for (const arr of bh.values()) for (const p of arr) allY.push(p.indexed);
-    const yMn = allY.length ? Math.min(...allY) : 0;
-    const yMx = allY.length ? Math.max(...allY) : 1;
-    const padY = (yMx - yMn) * 0.1 || 0.05;
     const ldays = [...dv.keys()].sort((a, b) => a - b);
+    // Day the indexed price hit its highest value within the window —
+    // gives readers a causal hook: dots before peakDay caught the move.
+    let peak: number | null = null;
+    let peakVal = -Infinity;
+    for (const d of ldays) {
+      const v = dv.get(d) as number;
+      if (v > peakVal) {
+        peakVal = v;
+        peak = d;
+      }
+    }
     return {
       dayValues: dv,
       byHandle: bh,
-      yMin: Math.max(0, yMn - padY),
-      yMax: yMx + padY,
+      yMin: sharedY.yMin,
+      yMax: sharedY.yMax,
       lineDays: ldays,
+      peakDay: peak,
     };
-  }, [token.series, token.mentions, horizon]);
+  }, [token.series, token.mentions, horizon, sharedY]);
 
   const xScale = (day: number) =>
     pad.left + (day / Math.max(horizon, 1)) * innerW;
@@ -389,6 +421,11 @@ function TokenPanel({
           </div>
           <div className="text-[10px] text-muted">
             t0 {fmtDate(token.t0_ts)} · {horizon}d window
+            {peakDay !== null ? (
+              <span title="day the token's indexed price peaked within the window — dots before this caught the move">
+                {" · peak d"}{peakDay}
+              </span>
+            ) : null}
           </div>
         </div>
         <div className="text-right">
@@ -441,38 +478,33 @@ function TokenPanel({
           height={HEIGHT}
           className="absolute inset-0 select-none"
         >
-          {/* Y grid + tick labels */}
+          {/* Y tick labels — minimal, no gridlines (the t0 reference below
+              carries the only horizontal rule we need). */}
           {yTicks.map((v, i) => (
-            <g key={`yt-${i}`}>
-              <line
-                x1={pad.left}
-                x2={pad.left + innerW}
-                y1={yScale(v)}
-                y2={yScale(v)}
-                stroke="rgba(255,255,255,0.06)"
-                strokeDasharray="3 3"
-              />
-              <text
-                x={pad.left - 4}
-                y={yScale(v) + 3}
-                textAnchor="end"
-                fill="#9aa0a6"
-                fontSize={10}
-              >
-                {fmtIndexed(v)}
-              </text>
-            </g>
+            <text
+              key={`yt-${i}`}
+              x={pad.left - 4}
+              y={yScale(v) + 3}
+              textAnchor="end"
+              fill="#9aa0a6"
+              fontSize={10}
+            >
+              {fmtPctGain(v)}
+            </text>
           ))}
 
-          {/* Reference line at indexed=1 (token's t0 price) */}
+          {/* Reference line at indexed=1 (token's t0 price) — promoted from
+              dashed gridline to the panel's primary horizontal rule, since
+              "did the token beat its starting point" is the entire question.
+              The y-axis label at this row is already "0%" via fmtPctGain. */}
           {yMin <= 1 && yMax >= 1 ? (
             <line
               x1={pad.left}
               x2={pad.left + innerW}
               y1={yScale(1)}
               y2={yScale(1)}
-              stroke="rgba(255,255,255,0.22)"
-              strokeDasharray="2 4"
+              stroke="rgba(255,255,255,0.32)"
+              strokeWidth={1}
             />
           ) : null}
 
@@ -596,7 +628,7 @@ function TokenPanel({
               <span>
                 d{tooltip.day}
                 {tooltip.indexed !== null ? (
-                  <span className="text-ink"> · {fmtIndexed(tooltip.indexed)}</span>
+                  <span className="text-ink"> · {fmtPctGain(tooltip.indexed)}</span>
                 ) : null}
               </span>
               {tooltip.dots.length > 1 ? (

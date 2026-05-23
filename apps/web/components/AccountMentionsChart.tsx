@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import {
-  CartesianGrid,
   Line,
   LineChart,
   ReferenceLine,
@@ -146,8 +145,10 @@ export function AccountMentionsChart({ data }: Props) {
         points,
       });
     }
-    // Sort by |meanFinal| descending so the top legend = biggest movers; ties broken by n.
-    tokens.sort((a, b) => Math.abs(b.meanFinal) - Math.abs(a.meanFinal) || b.n - a.n);
+    // Sort by signed meanFinal descending — best calls first, worst last.
+    // Earlier we sorted by |meanFinal| (biggest movers first regardless of
+    // sign), but for an account view the reader's expectation is best→worst.
+    tokens.sort((a, b) => b.meanFinal - a.meanFinal || b.n - a.n);
 
     // Build wide rows for recharts: { day, SYM1, SYM2, ... }
     const xMax = horizon;
@@ -210,10 +211,9 @@ export function AccountMentionsChart({ data }: Props) {
           <ResponsiveContainer width="100%" height="100%">
             <LineChart
               data={rows}
-              margin={{ top: 12, right: 24, left: 4, bottom: 8 }}
+              margin={{ top: 12, right: 80, left: 4, bottom: 8 }}
               onClick={() => setPinned(null)}
             >
-              <CartesianGrid stroke="rgba(255,255,255,0.06)" strokeDasharray="3 3" />
               <XAxis
                 dataKey="day"
                 type="number"
@@ -256,9 +256,21 @@ export function AccountMentionsChart({ data }: Props) {
               {tokens.map((t, i) => {
                 const isActive = activeSym === t.symbol;
                 const anyActive = activeSym !== null;
-                const opacity = !anyActive ? 0.95 : isActive ? 1 : 0.15;
-                const width = isActive ? 2.6 : 1.6;
+                // Tufte layering: top-3 tokens (best signed meanFinal) forward;
+                // rest recede until hovered/pinned.
+                const opacity = !anyActive
+                  ? i < 3
+                    ? 0.95
+                    : 0.35
+                  : isActive
+                    ? 1
+                    : 0.15;
+                const width = isActive ? 2.6 : i < 3 ? 1.8 : 1.2;
                 const color = tokenColor(i);
+                // Last day in the trajectory — used by the dot renderer to
+                // direct-label `SYM` at the line's right endpoint.
+                const lastDay =
+                  t.points.length > 0 ? t.points[t.points.length - 1].day : null;
                 return (
                   <Line
                     key={t.symbol}
@@ -267,13 +279,19 @@ export function AccountMentionsChart({ data }: Props) {
                     stroke={color}
                     strokeWidth={width}
                     strokeOpacity={opacity}
-                    dot={{
-                      r: isActive ? 3 : 2,
-                      fill: color,
-                      stroke: "rgba(0,0,0,0.6)",
-                      strokeWidth: 0.5,
-                      fillOpacity: opacity,
-                    }}
+                    // Dots are suppressed at non-endpoint days. Previously a
+                    // dot rendered at every interpolated day, which made
+                    // sparse data look as dense as real samples — that's the
+                    // graphical-integrity violation called out by the audit.
+                    dot={(dotProps) =>
+                      renderMentionDot(dotProps, {
+                        color,
+                        opacity,
+                        symbol: t.symbol,
+                        lastDay,
+                        isActive,
+                      })
+                    }
                     activeDot={{
                       r: 5,
                       fill: color,
@@ -401,6 +419,63 @@ export function AccountMentionsChart({ data }: Props) {
         mentions at each day-from-tweet (linearly interpolated where samples don't line up).
       </p>
     </div>
+  );
+}
+
+// Per-point dot renderer. Default: nothing — the line itself carries the
+// trajectory and the existing dot-per-day was visually overstating how much
+// real data backs each token. Only emits geometry at the line's endpoint to
+// carry the direct `SYM` label.
+type MentionDotInput = {
+  cx?: number;
+  cy?: number;
+  payload?: { day?: number } | null;
+};
+
+function renderMentionDot(
+  props: MentionDotInput,
+  opts: {
+    color: string;
+    opacity: number;
+    symbol: string;
+    lastDay: number | null;
+    isActive: boolean;
+  },
+) {
+  const { cx, cy, payload } = props;
+  if (
+    typeof cx !== "number" ||
+    typeof cy !== "number" ||
+    !payload ||
+    typeof payload.day !== "number" ||
+    opts.lastDay === null ||
+    payload.day !== opts.lastDay
+  ) {
+    return <g />;
+  }
+  return (
+    <g>
+      <circle
+        cx={cx}
+        cy={cy}
+        r={opts.isActive ? 3 : 2.5}
+        fill={opts.color}
+        fillOpacity={Math.max(opts.opacity, 0.6)}
+        stroke="rgba(0,0,0,0.6)"
+        strokeWidth={0.5}
+      />
+      <text
+        x={cx + 6}
+        y={cy + 3}
+        fill={opts.color}
+        fillOpacity={Math.max(opts.opacity, 0.7)}
+        fontSize={10}
+        fontWeight={opts.isActive ? 600 : 500}
+        style={{ pointerEvents: "none" }}
+      >
+        {opts.symbol}
+      </text>
+    </g>
   );
 }
 
