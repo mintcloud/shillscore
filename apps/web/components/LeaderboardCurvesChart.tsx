@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import {
-  CartesianGrid,
   Line,
   LineChart,
   ReferenceLine,
@@ -264,13 +263,12 @@ export function LeaderboardCurvesChart({ data }: Props) {
           <ResponsiveContainer width="100%" height="100%">
             <LineChart
               data={rows}
-              margin={{ top: 12, right: 24, left: 4, bottom: 8 }}
+              margin={{ top: 12, right: 96, left: 4, bottom: 8 }}
               onClick={() => {
                 setPinned(null);
                 setSelected(null);
               }}
             >
-              <CartesianGrid stroke="rgba(255,255,255,0.06)" strokeDasharray="3 3" />
               <XAxis
                 dataKey="ts"
                 type="number"
@@ -313,8 +311,18 @@ export function LeaderboardCurvesChart({ data }: Props) {
               {orderedLines.map((l) => {
                 const isActive = activeHandle === l.handle;
                 const anyActive = activeHandle !== null;
-                const opacity = !anyActive ? 0.95 : isActive ? 1 : 0.15;
-                const width = isActive ? 2.6 : 1.6;
+                // Tufte layering: top-3 forward by default; ranks 4-10 recede.
+                // Lookup against original `lines` (rank order) — orderedLines
+                // shuffles for z-order only.
+                const rank = lines.findIndex((x) => x.handle === l.handle);
+                const opacity = !anyActive
+                  ? rank < 3
+                    ? 0.95
+                    : 0.35
+                  : isActive
+                    ? 1
+                    : 0.15;
+                const width = isActive ? 2.6 : rank < 3 ? 1.8 : 1.2;
                 const pointsForLine = pointIndex.get(l.handle);
                 return (
                   <Line
@@ -337,6 +345,8 @@ export function LeaderboardCurvesChart({ data }: Props) {
                         selectedTs:
                           selected?.handle === l.handle ? selected.ts : null,
                         onPick: (ts) => pickDot(l.handle, ts),
+                        endTs: xDomain[1],
+                        handle: l.handle,
                       })
                     }
                     activeDot={{
@@ -379,7 +389,19 @@ export function LeaderboardCurvesChart({ data }: Props) {
         </p>
       )}
 
-      {/* Legend / score-comparison strip */}
+      {/* Reader's note — appears before the score table so the three columns
+          are explained first. */}
+      <p className="text-[11px] text-muted">
+        Why three numbers? The chart plots the running{" "}
+        <span className="text-ink">raw mean</span> — easy to read off as a
+        curve but volatile. The leaderboard sorts by{" "}
+        <span className="text-ink">dampened</span> = median × √(N / (N + 5)),
+        which trims tails and penalises thin samples. Hover or click a row to
+        isolate that account.
+      </p>
+
+      {/* Score-comparison strip — colour is reserved for the damped column,
+          which is the actual ranking key. */}
       <div className="overflow-x-auto rounded-lg border border-white/10 bg-surface">
         <table className="w-full text-xs">
           <thead className="bg-white/[0.03] text-[10px] uppercase tracking-wider text-muted">
@@ -429,30 +451,14 @@ export function LeaderboardCurvesChart({ data }: Props) {
                     </span>
                   </td>
                   <td className="px-2 py-1.5 text-right tabular-nums text-muted">{l.n}</td>
-                  <td
-                    className={`px-2 py-1.5 text-right tabular-nums ${
-                      l.final > 0
-                        ? "text-emerald-400"
-                        : l.final < 0
-                          ? "text-rose-400"
-                          : "text-muted"
-                    }`}
-                  >
+                  <td className="px-2 py-1.5 text-right tabular-nums text-ink">
                     {fmtPct(l.final)}
                   </td>
-                  <td
-                    className={`px-2 py-1.5 text-right tabular-nums ${
-                      (l.median ?? 0) > 0
-                        ? "text-emerald-400"
-                        : (l.median ?? 0) < 0
-                          ? "text-rose-400"
-                          : "text-muted"
-                    }`}
-                  >
+                  <td className="px-2 py-1.5 text-right tabular-nums text-ink">
                     {fmtPct(l.median)}
                   </td>
                   <td
-                    className={`px-2 py-1.5 text-right tabular-nums ${
+                    className={`px-2 py-1.5 text-right tabular-nums font-semibold ${
                       l.damped > 0
                         ? "text-emerald-400"
                         : l.damped < 0
@@ -468,13 +474,6 @@ export function LeaderboardCurvesChart({ data }: Props) {
           </tbody>
         </table>
       </div>
-      <p className="text-[10px] text-muted">
-        Why three numbers? The chart plots the running <span className="text-ink">raw mean</span>{" "}
-        — easy to read off as a curve but volatile. Each dot is one matured call; click
-        it to see the tweet and how much it nudged the mean. The leaderboard sorts by{" "}
-        <span className="text-ink">dampened</span> = median × √(N / (N + 5)), which trims tails and
-        penalizes thin samples. Hover or click a row to isolate that account.
-      </p>
     </div>
   );
 }
@@ -504,6 +503,8 @@ function renderCurveDot(
     points: Map<number, EquityCurvePoint> | undefined;
     selectedTs: number | null;
     onPick: (ts: number) => void;
+    endTs: number;
+    handle: string;
   },
 ) {
   const { cx, cy, payload } = props;
@@ -517,18 +518,37 @@ function renderCurveDot(
   }
   const ts = payload.ts;
   const mention = opts.points?.get(ts);
+  // Endpoint = rightmost ts for this account. Direct-label `@handle` there
+  // so the chart self-explains instead of needing a colour legend lookup.
+  const isEndpoint = ts === opts.endTs;
+  const endpointLabel = isEndpoint ? (
+    <text
+      x={cx + 6}
+      y={cy + 3}
+      fill={opts.color}
+      fillOpacity={Math.max(opts.opacity, 0.7)}
+      fontSize={10}
+      fontWeight={opts.isActive ? 600 : 500}
+      style={{ pointerEvents: "none" }}
+    >
+      @{opts.handle}
+    </text>
+  ) : null;
   // No mention behind it (the "today" anchor) → plain, non-interactive dot.
   if (!mention) {
     return (
-      <circle
-        cx={cx}
-        cy={cy}
-        r={opts.isActive ? 3 : 2.2}
-        fill={opts.color}
-        fillOpacity={opts.opacity}
-        stroke="rgba(0,0,0,0.6)"
-        strokeWidth={0.5}
-      />
+      <g>
+        <circle
+          cx={cx}
+          cy={cy}
+          r={opts.isActive ? 3 : 2.2}
+          fill={opts.color}
+          fillOpacity={opts.opacity}
+          stroke="rgba(0,0,0,0.6)"
+          strokeWidth={0.5}
+        />
+        {endpointLabel}
+      </g>
     );
   }
   const isSelected = opts.selectedTs === ts;
@@ -552,6 +572,7 @@ function renderCurveDot(
         stroke={isSelected ? "#ffffff" : "rgba(0,0,0,0.6)"}
         strokeWidth={isSelected ? 1.6 : 0.5}
       />
+      {endpointLabel}
     </g>
   );
 }
